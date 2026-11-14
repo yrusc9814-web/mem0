@@ -1,0 +1,14 @@
+{
+  "name": "mem0-extension",
+  "version": "0.1.4",
+  "private": true,
+  "description": "mem0 浏览器插件（Chrome / Edge，MV3）",
+  "scripts": {
+    "test": "node --no-warnings test/run.mjs",
+    "zip": "node scripts/zip.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0",
+    "ws": "8.22.2"
+  }
+}

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN" class="tray">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'" />
+  <title>mem0</title>
+  <link rel="stylesheet" href="fonts/fonts.css" />
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="tray.css" />
+  <script src="theme.js"></script>
+</head>
+<body class="tray-body">
+  <div class="tray-root">
+    <div class="panel" id="panel" role="dialog" aria-label="mem0 快捷面板">
+      <header class="tp-top">
+        <div class="tp-logo" data-brand></div>
+        <span class="tp-word">mem0</span>
+        <span class="tp-sync" id="tp-sync"><i class="dot"></i><span id="tp-sync-text">–</span></span>
+        <button class="tp-icon" id="tp-refresh" type="button" title="立即扫描" aria-label="立即扫描" data-icon="refresh"></button>
+      </header>
+
+      <section class="tp-stats">
+        <div class="tp-card" id="tp-card-backup">
+          <div class="tp-lbl"><i data-icon="arrowDown"></i>今天备份</div>
+          <div class="tp-num"><b id="tp-backup">0</b><span>条消息</span></div>
+        </div>
+        <div class="tp-card" id="tp-card-mcp">
+          <div class="tp-lbl"><i data-icon="swap"></i>今天互通</div>
+          <div class="tp-num accent"><b id="tp-mcp">0</b><span>次</span></div>
+        </div>
+      </section>
+
+      <section class="tp-recent">
+        <div class="tp-h">最近活动</div>
+        <div class="tp-list" id="tp-list"></div>
+      </section>
+
+      <footer class="tp-foot" id="tp-foot">
+        <button class="tp-open" id="tp-open" type="button">打开 mem0<i data-icon="arrowUpRight"></i></button>
+        <button class="tp-power" id="tp-quit" type="button" title="退出 mem0" aria-label="退出 mem0" data-icon="power"></button>
+        <div class="tp-confirm" id="tp-confirm" role="alertdialog" aria-label="退出确认" aria-hidden="true">
+          <span class="tp-confirm-text" id="tp-confirm-text">退出 mem0？</span>
+          <button class="tp-cbtn" id="tp-cancel" type="button">取消</button>
+          <button class="tp-cbtn bad" id="tp-quit-yes" type="button">退出</button>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <script src="icons.js"></script>
+  <script src="common.js"></script>
+  <script src="tray.js"></script>
+</body>
+</html>

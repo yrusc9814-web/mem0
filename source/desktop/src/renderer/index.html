@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'" />
+  <title>mem0</title>
+  <link rel="stylesheet" href="fonts/fonts.css" />
+  <link rel="stylesheet" href="style.css" />
+  <script src="theme.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="logo" title="mem0" data-brand></div>
+    <button class="nav" data-view="home" data-icon="home"><span>首页</span></button>
+    <button class="nav" data-view="records" data-icon="chat"><span>记录</span></button>
+    <button class="nav" data-view="connect" data-icon="link"><span>连接</span></button>
+    <div class="top-right">
+      <span id="sync-status" class="sync"><i class="dot"></i><span id="sync-text">–</span></span>
+      <button class="icon-btn" id="btn-rescan" title="立即扫描" data-icon="refresh"></button>
+      <button class="icon-btn" id="btn-theme" title="切换浅色 / 深色" data-icon="moon"></button>
+      <button class="icon-btn" id="btn-settings" title="设置" data-icon="gear"></button>
+    </div>
+  </header>
+
+  <main>
+    <!-- 首页 -->
+    <section class="view" id="view-home">
+      <div class="col">
+        <label class="search"><i data-icon="search"></i><input id="home-q" type="search" placeholder="搜索所有 AI 对话…" autocomplete="off" /></label>
+        <h3>今日动态</h3>
+        <div class="grid2">
+          <div class="card clickable" id="card-backup">
+            <div class="hd"><i data-icon="download"></i>本地备份<i class="chev" data-icon="chevron"></i></div>
+            <div class="today"><span class="big" id="today-convs">0</span> <span class="sub" id="today-msgs">个对话更新</span></div>
+            <div class="sub" id="backup-sub"></div>
+          </div>
+          <div class="card clickable" id="card-mcp">
+            <div class="hd"><i data-icon="swap"></i>让 AI 读取历史<span class="hd-note" id="mcp-today">今天互通 <b id="mcp-today-n">0</b> 次</span><i class="chev" data-icon="chevron"></i></div>
+            <div class="mcp-flow" id="mcp-flow"></div>
+            <div class="sub" id="mcp-sub"></div>
+          </div>
+        </div>
+        <div class="card storage">
+          <div class="hd"><i data-icon="layers"></i>总存储<span class="hd-right"><b id="total-msgs">0</b> <span class="sub" id="total-convs">条消息</span></span></div>
+          <div class="bar" id="storage-bar"></div>
+          <div class="legend" id="storage-legend"></div>
+        </div>
+        <h3 class="row-between">最近活动<button class="text-btn" id="btn-all">查看全部 ›</button></h3>
+        <div class="tl" id="timeline"></div>
+      </div>
+    </section>
+
+    <!-- 记录 -->
+    <section class="view" id="view-records">
+      <aside class="side">
+        <label class="search small"><i data-icon="search"></i><input id="q" type="search" placeholder="搜索" autocomplete="off" /></label>
+        <div class="filter-row">
+          <div class="srcfilter" id="srcfilter">
+            <button class="chipsel" id="filter-btn" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="filter-menu"><span id="filter-label">全部来源</span><i data-icon="down"></i></button>
+            <div class="pop menu hidden" id="filter-menu" role="listbox" aria-multiselectable="true" aria-label="按来源筛选"></div>
+          </div>
+        </div>
+        <div class="list" id="list"></div>
+      </aside>
+      <div class="detail" id="detail">
+        <div class="scroller" id="scroller"><div class="empty">选择左侧的对话查看全文</div></div>
+      </div>
+    </section>
+
+    <!-- 连接 -->
+    <section class="view" id="view-connect">
+      <div class="col">
+        <div class="tabs">
+          <button class="tab on" data-tab="sources">备份来源</button>
+          <button class="tab" data-tab="mcp">让 AI 读取（MCP）</button>
+        </div>
+
+        <div class="tabpane on" id="tab-sources">
+          <h3 class="row-between">本机 AI 对话<span class="h3-count" id="local-count"></span></h3>
+          <p class="hint">自动读取本机会话文件，实时备份。只读，不修改原文件。</p>
+          <div class="group" id="local-sources"></div>
+          <h3>网页 AI 对话</h3>
+          <div class="group">
+            <div class="grow">
+              <div class="logo sq" data-brand></div>
+              <div class="grow-main">
+                <div class="nm">mem0 浏览器插件<span class="badge" id="plugin-badge">未配对</span></div>
+                <div class="ds" id="plugin-desc"></div>
+              </div>
+              <div class="end"><button class="btn" id="btn-pair">配对</button></div>
+            </div>
+            <div class="pair hidden" id="pair"></div>
+            <div class="web-list" id="web-sources"></div>
+          </div>
+        </div>
+
+        <div class="tabpane" id="tab-mcp">
+          <h3>本地 MCP 服务</h3>
+          <div class="group">
+            <div class="grow">
+              <div class="grow-main"><div class="nm">服务地址</div><div class="ds mono" id="mcp-url">–</div></div>
+              <div class="end"><button class="btn" id="btn-copy-mcp-url">复制</button><span class="badge" id="mcp-badge">–</span></div>
+            </div>
+          </div>
+          <div class="mcp-help-head" id="mcp-help-head">
+            <h3>一键连接<span class="mcp-help" id="mcp-help-wrap">
+              <button class="mcp-help-btn" id="mcp-help" type="button" data-icon="help" aria-label="手动添加说明" aria-describedby="mcp-help-pop"></button>
+            </span></h3>
+            <div class="pop mcp-help-pop" id="mcp-help-pop" role="tooltip">
+              <span class="mcp-help-t">用 Magpie 代理？按这样手动添加：</span>
+              <ol class="mcp-help-steps">
+                <li>打开 Magpie → 资源库 → MCP 服务器 → 添加</li>
+                <li>名称填 mem0，运行方式选「命令」</li>
+                <li>命令填：<code class="mcp-help-cmd" id="mcp-help-cmd">npx -y mcp-remote</code></li>
+                <li>勾选要用的 Agent（如 Claude Desktop、WorkBuddy），保存</li>
+                <li>重启对应客户端</li>
+              </ol>
+              <span class="mcp-help-note">需要电脑已安装 Node.js。密钥变更后，这里的地址也要同步更新。</span>
+            </div>
+          </div>
+          <p class="hint">写入对方的 MCP 配置（原文件自动备份），重启该客户端后生效。</p>
+          <div class="group" id="clients"></div>
+          <h3>其它客户端</h3>
+          <p class="hint">Cursor、Cherry Studio 等，把下面的配置粘贴进它的 MCP 设置。</p>
+          <div class="group pad">
+            <pre id="manual-config"></pre>
+            <button class="btn" id="btn-copy-config">复制配置</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="view" id="view-settings">
+      <div class="col">
+        <h2 class="serif">设置</h2>
+        <h3>外观</h3>
+        <div class="group">
+          <div class="grow">
+            <div class="grow-main"><div class="nm">主题</div><div class="ds">默认跟随系统</div></div>
+            <div class="end seg" id="theme-seg">
+              <button data-theme-opt="system">跟随系统</button><button data-theme-opt="light">浅色</button><button data-theme-opt="dark">深色</button>
+            </div>
+          </div>
+        </div>
+        <h3>数据</h3>
+        <div class="group">
+          <div class="grow">
+            <div class="grow-main"><div class="nm">数据目录</div><div class="ds mono" id="datadir">–</div></div>
+            <div class="end"><button class="btn" id="btn-datadir-change">更改</button><button class="btn" id="btn-datadir">打开</button></div>
+          </div>
+          <div class="grow">
+            <div class="grow-main"><div class="nm">重新扫描本机来源</div><div class="ds">平时会自动实时备份，一般不需要手动扫描</div></div>
+            <div class="end"><button class="btn" id="btn-rescan2">立即扫描</button></div>
+          </div>
+        </div>
+        <h3>浏览器插件</h3>
+        <div class="group">
+          <div class="grow">
+            <div class="grow-main"><div class="nm">插件桥</div><div class="ds mono" id="bridge-url">–</div></div>
+            <div class="end"><button class="btn danger" id="btn-revoke">断开所有插件</button></div>
+          </div>
+        </div>
+        <p class="hint center" id="version"></p>
+      </div>
+    </section>
+  </main>
+
+  <script src="icons.js"></script>
+  <script src="common.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

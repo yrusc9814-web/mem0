@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "mem0 · AI 对话备份",
+  "short_name": "mem0",
+  "version": "0.1.4",
+  "description": "把 ChatGPT、Claude、Gemini、DeepSeek、豆包、元宝、Kimi、千问、Grok、Hark 的对话实时备份到本机 mem0 桌面端。",
+  "minimum_chrome_version": "116",
+  "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "action": { "default_popup": "src/popup/popup.html", "default_icon": { "16": "icons/16.png", "32": "icons/32.png" } },
+  "background": { "service_worker": "src/background.js", "type": "module" },
+  "permissions": ["storage", "unlimitedStorage", "alarms"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://claude.ai/*",
+    "https://gemini.google.com/*",
+    "https://chat.deepseek.com/*",
+    "https://www.doubao.com/*",
+    "https://yuanbao.tencent.com/*",
+    "https://www.kimi.com/*",
+    "https://kimi.moonshot.cn/*",
+    "https://www.qianwen.com/*",
+    "https://tongyi.aliyun.com/*",
+    "https://chat.qwen.ai/*",
+    "https://www.google.com/search*",
+    "https://grok.com/*",
+    "https://hark.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://claude.ai/*",
+        "https://gemini.google.com/*",
+        "https://chat.deepseek.com/*",
+        "https://www.doubao.com/*",
+        "https://yuanbao.tencent.com/*",
+        "https://www.kimi.com/*",
+        "https://kimi.moonshot.cn/*",
+        "https://www.qianwen.com/*",
+        "https://tongyi.aliyun.com/*",
+        "https://chat.qwen.ai/*",
+        "https://www.google.com/search*",
+        "https://grok.com/*",
+        "https://hark.com/*"
+      ],
+      "js": ["src/content/platforms.js", "src/content/engine.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

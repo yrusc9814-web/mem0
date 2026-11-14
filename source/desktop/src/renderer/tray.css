@@ -1,0 +1,73 @@
+/* 托盘快捷小窗：复用 style.css 的配色变量 / 字体 / .av / .src-label，这里只写小窗自身布局 */
+html.tray, html.tray body { background: transparent; height: auto; min-height: 0; overflow: hidden; }
+body.tray-body { display: block; user-select: none; -webkit-user-select: none; }
+/* 窗口四周的透明投影边距（与 src/main/tray-window.js 的 INSET 一致） */
+.tray-root { padding: 18px; }
+.panel {
+  --panel-ring: 0 0 0 .5px rgba(20,20,19,.12);
+  width: 320px; border-radius: 14px; background: var(--bg); color: var(--text); overflow: hidden;
+  box-shadow: 0 4px 14px rgba(66,46,26,.16), 0 1px 3px rgba(66,46,26,.08), var(--panel-ring);
+}
+/* 深色：细微描边，防止融进深色壁纸 */
+:root[data-theme=dark] .panel { --panel-ring: 0 0 0 1px rgba(255,255,255,.10); box-shadow: 0 4px 14px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.3), var(--panel-ring); }
+
+/* 顶部栏 */
+.tp-top { display: flex; align-items: center; gap: 7px; padding: 13px 12px 10px 14px; }
+.tp-logo { width: 22px; height: 22px; flex-shrink: 0; }
+.tp-word { font-weight: 600; font-size: 15px; letter-spacing: -.1px; }
+.tp-sync { margin-left: auto; display: inline-flex; align-items: center; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.tp-sync .dot { margin-right: 5px; }
+.tp-sync.warn .dot { background: var(--warn); }
+.tp-icon { width: 26px; height: 26px; border-radius: 7px; border: 0; background: none; color: var(--muted); display: grid; place-items: center; padding: 0; flex-shrink: 0; }
+.tp-icon svg { width: 15px; height: 15px; }
+.tp-icon:hover { background: var(--surface); color: var(--text); }
+.tp-icon.spinning svg { animation: tp-spin .9s linear infinite; }
+@keyframes tp-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .tp-icon.spinning svg { animation: none; }
+  .tp-icon.spinning { opacity: .55; }
+}
+
+/* 今日统计双卡 */
+.tp-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 2px 12px 2px; }
+.tp-card { background: var(--surface); border-radius: 10px; padding: 10px 12px 11px; box-shadow: inset 0 0 0 .5px var(--hair); min-width: 0; }
+.tp-lbl { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.tp-lbl svg { width: 13px; height: 13px; }
+.tp-num { margin-top: 5px; display: flex; align-items: baseline; gap: 4px; min-width: 0; }
+.tp-num b { font-family: var(--font-reading); font-synthesis-weight: none; font-size: 26px; line-height: 1.12; font-weight: 500; letter-spacing: -.3px; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; }
+.tp-num span { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.tp-num.accent b { color: var(--accent); }
+
+/* 最近活动 */
+.tp-recent { padding: 12px 6px 4px; }
+.tp-h { font-size: 12px; font-weight: 600; color: var(--text2); padding: 0 8px 4px; }
+.tp-row { display: flex; align-items: center; gap: 10px; width: 100%; padding: 7px 8px; border: 0; border-radius: 9px; background: none; text-align: left; color: var(--text); min-width: 0; }
+.tp-row:hover, .tp-row:focus-visible { background: var(--surface); outline: none; }
+.tp-main { display: block; flex: 1; min-width: 0; }
+.tp-t { display: block; font-size: 13px; font-weight: 500; line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tp-sub { display: flex; align-items: center; gap: 5px; font-size: 11.5px; line-height: 1.45; color: var(--muted); white-space: nowrap; min-width: 0; overflow: hidden; }
+.tp-sub .src-label { flex: 0 1 auto; }
+.tp-sub .cnt { overflow: hidden; text-overflow: ellipsis; }
+.tp-time { font-size: 11.5px; color: var(--muted); white-space: nowrap; align-self: flex-start; margin-top: 1px; }
+.tp-empty { padding: 14px 10px 14px; text-align: center; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+
+/* 底部栏 */
+.tp-foot { display: flex; align-items: center; gap: 8px; margin-top: 4px; padding: 10px 12px 12px 14px; box-shadow: inset 0 .5px 0 var(--line); }
+.tp-open { display: inline-flex; align-items: center; gap: 4px; height: 30px; padding: 0 12px 0 14px; border: 0; border-radius: 9px; background: var(--accent); color: #fff; font-size: 13px; font-weight: 500; }
+.tp-open:hover { background: var(--accent-hover); }
+.tp-open svg { width: 14px; height: 14px; stroke-width: 1.9; }
+.tp-power { margin-left: auto; width: 30px; height: 30px; border-radius: 8px; border: 0; background: none; color: var(--muted); display: grid; place-items: center; padding: 0; }
+.tp-power svg { width: 16px; height: 16px; }
+.tp-power:hover { background: var(--surface); color: var(--bad); }
+
+/* 退出确认条：叠在 .tp-foot 内部（绝对定位），切换 .confirming 不改变底部栏高度 */
+.tp-foot { position: relative; }
+.tp-confirm { position: absolute; inset: 0; display: none; align-items: center; gap: 6px; padding: 10px 12px 12px 14px; background: var(--bg); }
+.tp-foot.confirming .tp-confirm { display: flex; }
+.tp-foot.confirming .tp-open, .tp-foot.confirming .tp-power { visibility: hidden; }
+.tp-confirm-text { margin-right: auto; font-size: 13px; font-weight: 500; color: var(--text); white-space: nowrap; }
+.tp-cbtn { height: 30px; padding: 0 12px; border: 0; border-radius: 9px; background: none; color: var(--text2); font-size: 13px; font-weight: 500; }
+.tp-cbtn:hover:not(:disabled) { background: var(--surface); color: var(--text); }
+.tp-cbtn.bad { color: var(--bad); }
+.tp-cbtn.bad:hover:not(:disabled) { color: var(--bad); }
+.tp-cbtn:disabled { opacity: .5; }

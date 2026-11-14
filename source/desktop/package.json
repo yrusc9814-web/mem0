@@ -1,0 +1,72 @@
+{
+  "name": "mem0-desktop",
+  "productName": "mem0",
+  "version": "0.5.4",
+  "description": "本地备份所有 AI 对话（Claude Code、Codex、网页 AI），全文检索，并通过 MCP 让任意 AI 调取你的历史对话",
+  "main": "src/main/index.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --no-warnings test/independent.js && node scripts/check-font-coverage.js",
+    "selftest": "node --no-warnings scripts/selftest.js",
+    "dist:win": "electron-builder --win --x64",
+    "dist:mac": "electron-builder --mac zip --arm64",
+    "dist:linux": "electron-builder --linux AppImage"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "ws": "8.22.2",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "electron": "45.2.3",
+    "electron-builder": "26.18.0",
+    "resedit": "^1.7.2"
+  },
+  "build": {
+    "appId": "dev.mem0.desktop",
+    "productName": "mem0",
+    "files": [
+      "src/**/*",
+      "src/main/assets/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "shortcutName": "mem0",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "include": "build/installer.nsh"
+    },
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "identity": null
+    },
+    "afterPack": "scripts/after-pack.js"
+  }
+}
