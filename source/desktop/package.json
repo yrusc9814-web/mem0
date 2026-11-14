@@ -1,7 +1,7 @@
 {
   "name": "mem0-desktop",
   "productName": "mem0",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "本地备份所有 AI 对话（Claude Code、Codex、网页 AI），全文检索，并通过 MCP 让任意 AI 调取你的历史对话",
   "main": "src/main/index.js",
   "license": "MIT",

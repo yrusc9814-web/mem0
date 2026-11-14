@@ -131,10 +131,9 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       const full = store.getConversation(cc.id);
       assert.equal(full.workspace, '/home/me/proj');
       const m = msgs(store, cc.id);
-      assert.deepEqual(m.map((x) => x.role), ['user', 'assistant', 'user', 'user']);
-      assert.match(m[1].content, /第一块\n第二块\n\[调用工具 Bash\]/);
-      assert.ok(!m.some((x) => /子任务|meta|command-name|secret/.test(x.content)));
-      assert.ok(m[2].content.length < 500, 'tool_result 被截断');
+      assert.deepEqual(m.map((x) => x.role), ['user', 'assistant', 'user']);
+      assert.equal(m[1].content, '第一块\n第二块');
+      assert.ok(!m.some((x) => /子任务|meta|command-name|secret|\[调用工具|\[工具结果\]/.test(x.content)));
     });
     await t('1 claude-code', 'unicode/emoji 原样保存并可搜索', () => {
       const m = msgs(store, cc.id);
@@ -144,7 +143,7 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
     });
     await t('1 claude-code', '5MB 超大消息完整保存', () => {
       const m = msgs(store, cc.id);
-      assert.equal(m[3].content.length, huge.length);
+      assert.equal(m[2].content.length, huge.length);
       assert.equal(store.search('HHH尾巴').length, 1);
     });
     await t('1 claude-code', '缺 sessionId → 用文件名作 externalId', () => {
@@ -162,30 +161,30 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       append(path.join(dir, 'cc-1.jsonl'), ev('assistant', '新的回复') + '\n');
       await ing.scanOnce();
       const m = msgs(store, cc.id);
-      assert.equal(m.length, 5);
-      assert.equal(m[4].content, '新的回复');
+      assert.equal(m.length, 4);
+      assert.equal(m[3].content, '新的回复');
     });
     await t('1 claude-code', '写入中半行：先跳过，补全后正确入库且不重复', async () => {
       const f = path.join(dir, 'cc-1.jsonl');
       const line = ev('user', '半行写入的消息');
       append(f, line.slice(0, 20));
       await ing.scanOnce();
-      assert.equal(msgs(store, cc.id).length, 5);
+      assert.equal(msgs(store, cc.id).length, 4);
       append(f, line.slice(20) + '\n');
       await ing.scanOnce();
       const m = msgs(store, cc.id);
-      assert.equal(m.length, 6);
-      assert.equal(m[5].content, '半行写入的消息');
+      assert.equal(m.length, 5);
+      assert.equal(m[4].content, '半行写入的消息');
       age(f); await ing.scanOnce();
-      assert.equal(msgs(store, cc.id).length, 6);
+      assert.equal(msgs(store, cc.id).length, 5);
     });
     await t('1 claude-code', '2 秒内有改动且已有游标 → 本轮跳过，下轮再读', async () => {
       const f = path.join(dir, 'cc-1.jsonl');
       fs.appendFileSync(f, ev('user', '刚刚写入') + '\n'); // mtime=now
       await ing.scanOnce();
-      assert.equal(msgs(store, cc.id).length, 6);
+      assert.equal(msgs(store, cc.id).length, 5);
       age(f); await ing.scanOnce();
-      assert.equal(msgs(store, cc.id).length, 7);
+      assert.equal(msgs(store, cc.id).length, 6);
     });
     await t('1 claude-code', '来源关闭后不采集', async () => {
       store.setSourceEnabled('claude-code', false);
@@ -193,6 +192,177 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       await ing.scanOnce();
       assert.ok(!convs(store, 'claude-code').some((c) => c.title === '关闭时写入'));
       store.setSourceEnabled('claude-code', true);
+    });
+    store.close();
+  }
+
+  // ---------- Claude Code：只保留用户和 AI 正文（0.5.5 F1） ----------
+  {
+    const dir = path.join(T, 'claude-text-only');
+    const f = path.join(dir, 'text-only.jsonl');
+    const line = (ev) => j({ sessionId: 'cc-text', cwd: '/w/cc', timestamp: ts(1), ...ev });
+    const msg = (type, content, extra = {}) => line({ type, message: { role: type, content }, ...extra });
+    const rows = [
+      line({ type: 'summary', summary: '正文过滤标题' }),
+      // 正常用户正文
+      msg('user', '你好，帮我看看这个 bug'),
+      // 工具调用块丢弃，文本保留
+      msg('assistant', [{ type: 'text', text: '我先看看。' }, { type: 'tool_use', name: 'Bash', input: { cmd: 'ls' } }]),
+      // 只含 tool_result 的 user 事件整条丢弃
+      msg('user', [{ type: 'tool_result', tool_use_id: 't1', content: 'X'.repeat(1000) }]),
+      // 工具块拆开的多条 assistant 文本仍合并为一条
+      msg('assistant', [{ type: 'text', text: '找到了原因。' }, { type: 'tool_use', name: 'Read', input: { file: 'a.js' } }]),
+      msg('user', [{ type: 'tool_result', tool_use_id: 't2', content: '文件内容' }]),
+      msg('assistant', [{ type: 'text', text: '原因是缓存没清。' }]),
+      // 带 tool_result 但仍有正文的 user 事件：保留正文
+      msg('user', [{ type: 'tool_result', content: '输出' }, { type: 'text', text: '谢谢' }]),
+      // 中断提示
+      msg('user', '[Request interrupted by user]'),
+      msg('user', '[Request interrupted by user for tool use]'),
+      // 压缩上下文续接摘要
+      msg('user', 'This session is being continued from a previous conversation that ran out of context. 摘要内容'),
+      msg('user', 'This session is being continued from a previous conversation', { isCompactSummary: true }),
+      // 正文夹带多段、跨行 system-reminder：整段删除，其余保留
+      msg('user', '继续干活<system-reminder>\n多行注入\n第二行\n</system-reminder>中间<system-reminder>再一段</system-reminder>收尾'),
+      // 只剩 system-reminder → 整条丢弃
+      msg('user', '<system-reminder>只有注入</system-reminder>'),
+      // 各类注入标签开头 → 整条丢弃
+      ...['command-name', 'command-message', 'command-args', 'local-command-stdout', 'local-command-stderr', 'bash-input', 'bash-stdout', 'bash-stderr', 'task-notification', 'user-memory-input']
+        .map((tag) => msg('user', `<${tag}>注入内容</${tag}>`)),
+      // 压缩摘要事件标记
+      msg('user', '压缩摘要正文', { isCompactSummary: true }),
+      // 照旧跳过 meta / sidechain
+      msg('user', 'meta 正文', { isMeta: true }),
+      msg('user', '旁支正文', { isSidechain: true }),
+      // 只有图片 → [图片]；图片 + 文字 → 只留文字
+      msg('user', [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'x' } }]),
+      msg('user', [{ type: 'image', source: { data: 'x' } }, { type: 'text', text: '看图' }]),
+      // 只有 thinking/redacted_thinking 的 assistant 整条丢弃
+      msg('assistant', [{ type: 'thinking', thinking: '思考' }, { type: 'redacted_thinking', data: 'x' }]),
+      // thinking 与正文混排时只留正文
+      msg('assistant', [{ type: 'redacted_thinking', data: 'x' }, { type: 'text', text: '最后回答' }, { type: 'thinking', thinking: '思考' }]),
+    ];
+    write(f, rows.join('\n') + '\n');
+
+    await t('1 claude-code', 'F1 只保留正文：工具/思考/系统注入/中断/压缩摘要全部丢弃，assistant 分块仍合并', async () => {
+      const r = await ADAPTERS['claude-code'].read(f);
+      assert.ok(r);
+      assert.equal(r.externalId, 'cc-text');
+      assert.equal(r.workspace, '/w/cc');
+      assert.equal(r.title, '正文过滤标题');
+      assert.deepEqual(r.messages.map((m) => m.role), ['user', 'assistant', 'user', 'user', 'user', 'user', 'assistant']);
+      assert.deepEqual(r.messages.map((m) => m.content), [
+        '你好，帮我看看这个 bug',
+        '我先看看。\n找到了原因。\n原因是缓存没清。',
+        '谢谢',
+        '继续干活中间收尾',
+        '[图片]',
+        '看图',
+        '最后回答',
+      ]);
+    });
+    await t('1 claude-code', 'F1 结果不含工具占位、system-reminder、bash 包装、中断提示', async () => {
+      const r = await ADAPTERS['claude-code'].read(f);
+      const all = r.messages.map((m) => m.content).join('\n');
+      for (const bad of ['[调用工具', '[工具结果]', '<system-reminder', '<bash-', 'Request interrupted', 'This session is being continued', '只有注入', '注入内容', '压缩摘要正文', 'meta 正文', '旁支正文', '思考']) {
+        assert.ok(!all.includes(bad), `不应包含 ${bad}`);
+      }
+    });
+    await t('1 claude-code', 'F1 只剩注入/工具内容时 read() 返回 null（不入库）', async () => {
+      const only = path.join(dir, 'only-injected.jsonl');
+      write(only, [
+        msg('user', [{ type: 'tool_result', content: '只有结果' }]),
+        msg('user', '<system-reminder>注入</system-reminder>'),
+        msg('assistant', [{ type: 'thinking', thinking: '只有思考' }]),
+      ].join('\n') + '\n');
+      assert.equal(await ADAPTERS['claude-code'].read(only), null);
+    });
+  }
+
+  // ---------- Claude Code：已入库旧会话按新规则重读（0.5.5 F2） ----------
+  {
+    const store = freshStore();
+    const ing = new LocalIngestor(store, roots);
+    const dir = path.join(roots['claude-code'], '-home-me-f2');
+    const f = path.join(dir, 'f2.jsonl');
+    const ev = (type, content, extra = {}) => j({ type, sessionId: 'cc-f2', cwd: '/w/f2', timestamp: ts(1), message: { role: type, content }, ...extra });
+    // 文件里是工具块；旧解析器会把它们变成「[调用工具」「[工具结果]」文本入库
+    write(f, [
+      ev('user', '旧问题：怎么修缓存？'),
+      ev('assistant', [{ type: 'text', text: '旧回答：先看日志。' }, { type: 'tool_use', name: 'Bash', input: { cmd: 'ls' } }]),
+      ev('user', [{ type: 'tool_result', content: 'total 0' }, { type: 'text', text: '日志在这里' }]),
+      ev('assistant', '旧回答：清掉缓存就好。'),
+    ].join('\n') + '\n');
+
+    await t('1 claude-code F2', '迁移：旧格式入库 + 游标存在；执行迁移后 claude-code 游标被清、kv 标记写入、只执行一次', async () => {
+      // 直接按旧格式写库（含工具占位），并写游标模拟已入库的旧会话
+      store.upsertConversation({
+        source: 'claude-code', externalId: 'cc-f2', ingestMethod: 'local',
+        messages: [
+          { role: 'user', content: '旧问题：怎么修缓存？' },
+          { role: 'assistant', content: '旧回答：先看日志。\n[调用工具] Bash({"cmd":"ls"})' },
+          { role: 'user', content: '日志在这里\n[工具结果] total 0' },
+          { role: 'assistant', content: '旧回答：清掉缓存就好。' },
+        ],
+      });
+      const id = store.db.prepare("SELECT id FROM conversations WHERE source='claude-code' AND external_id='cc-f2'").get().id;
+      const sig = fs.statSync(f);
+      store.setCursor(f, 'claude-code', sig.size, sig.mtimeMs);
+      const before = msgs(store, id);
+      assert.deepEqual(before.map((m) => m.role), ['user', 'assistant', 'user', 'assistant']);
+      assert.ok(before.some((m) => m.content.includes('[调用工具')), '旧格式应含工具占位');
+      assert.equal(store.search('调用工具').length, 1, '旧内容应能被搜到');
+      assert.ok(store.getCursor(f), '应有游标');
+      assert.equal(store.getKv('claude_clean_v1'), null);
+      // 其它来源的游标不受影响
+      store.setCursor('/tmp/other-codex.jsonl', 'codex', 1, 1);
+
+      // 新版启动：未标记 → 清游标并重读
+      await ing.scanOnce();
+      assert.equal(store.getKv('claude_clean_v1'), '1');
+      const other = store.getCursor('/tmp/other-codex.jsonl');
+      assert.ok(other && other.size === 1 && other.mtime_ms === 1, '其它来源游标不应被清');
+      // 重读成功后游标按新文件签名写回
+      const cur = store.getCursor(f);
+      assert.ok(cur && cur.size === sig.size && cur.mtime_ms === Math.floor(sig.mtimeMs), '重读后应写回新游标');
+
+      // 迁移只在未标记时执行一次：再写一个游标，第二次启动不应清掉
+      const sig2 = fs.statSync(f);
+      store.setCursor(f, 'claude-code', sig2.size, sig2.mtimeMs);
+      const again = new LocalIngestor(store, roots);
+      await again.scanOnce();
+      assert.ok(store.getCursor(f), '第二次启动不应再清游标');
+      assert.equal(store.getKv('claude_clean_v1'), '1');
+    });
+
+    await t('1 claude-code F2', '重读后旧工具内容被删除：只剩正文、条数正确、搜索不再命中', async () => {
+      const id = store.db.prepare("SELECT id FROM conversations WHERE source='claude-code' AND external_id='cc-f2'").get().id;
+      const after = msgs(store, id);
+      assert.deepEqual(after.map((m) => m.content), [
+        '旧问题：怎么修缓存？',
+        '旧回答：先看日志。',
+        '日志在这里',
+        '旧回答：清掉缓存就好。',
+      ]);
+      assert.equal(after.length, 4);
+      assert.equal(store.db.prepare('SELECT message_count FROM conversations WHERE id = ?').get(id).message_count, 4);
+      assert.equal(store.search('调用工具').length, 0, '旧工具内容应搜不到');
+      assert.equal(store.search('工具结果').length, 0, '旧工具结果应搜不到');
+      assert.equal(store.search('缓存').length, 1, '正文仍可搜到');
+      store.db.exec("INSERT INTO messages_fts(messages_fts, rank) VALUES ('integrity-check', 1)");
+    });
+
+    await t('1 claude-code F2', '用户删除过的会话不被迁移重读复活（墓碑保持）', async () => {
+      const g = path.join(dir, 'f2-deleted.jsonl');
+      write(g, ev('user', '要删掉的会话', { sessionId: 'cc-f2-del' }) + '\n');
+      await ing.scanOnce();
+      const id = store.db.prepare("SELECT id FROM conversations WHERE source='claude-code' AND external_id='cc-f2-del'").get().id;
+      store.deleteConversation(id);
+      // 重置标记，模拟迁移再次发生（清游标后重读）
+      store.db.prepare('DELETE FROM kv WHERE k = ?').run('claude_clean_v1');
+      await new LocalIngestor(store, roots).scanOnce();
+      assert.equal(store.db.prepare('SELECT COUNT(*) n FROM conversations WHERE id = ?').get(id).n, 0, '删除的会话不应复活');
+      assert.ok(store.db.prepare('SELECT 1 FROM deleted_conversations WHERE id = ?').get(id), '墓碑仍在');
     });
     store.close();
   }
@@ -757,7 +927,7 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       assert.equal(JSON.stringify(a), JSON.stringify(b));
     };
 
-    // 旧实现：claude-code
+    // 参考实现：claude-code（整文件读取版，语义与逐行版一致）
     const oldClaude = async (file) => {
       const raw = await fs.promises.readFile(file, 'utf8');
       const messages = [];
@@ -766,22 +936,20 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       let summary = null;
       let customTitle = null;
       let aiTitle = null;
-      const textOf = (content, role) => {
+      const textOf = (content) => {
         if (typeof content === 'string') return content;
         if (!Array.isArray(content)) return '';
         const parts = [];
+        let hasImage = false;
         for (const b of content) {
           if (!b || typeof b !== 'object') continue;
           if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text);
-          else if (b.type === 'tool_use') parts.push(`[调用工具 ${b.name}] ${clip(JSON.stringify(b.input ?? {}), 400)}`);
-          else if (b.type === 'tool_result' && role === 'user') {
-            const t = typeof b.content === 'string' ? b.content : Array.isArray(b.content) ? b.content.map((x) => x?.text || '').join('\n') : '';
-            if (t) parts.push(`[工具结果] ${clip(t, 400)}`);
-          }
+          else if (b.type === 'image') hasImage = true;
         }
-        return parts.join('\n').trim();
+        const text = parts.join('\n').trim();
+        return text || (hasImage ? '[图片]' : '');
       };
-      const clip = (s, n) => (s.length > n ? s.slice(0, n) + '…' : s);
+      const INJECTED = /^<(command-name|command-message|command-args|local-command-stdout|local-command-stderr|bash-input|bash-stdout|bash-stderr|task-notification|user-memory-input)>/;
       for (const line of raw.split('\n')) {
         if (!line.trim()) continue;
         let ev;
@@ -792,12 +960,17 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
         if (ev.type === 'ai-title' && typeof ev.aiTitle === 'string') { aiTitle = ev.aiTitle; continue; }
         if (ev.type !== 'user' && ev.type !== 'assistant') continue;
         if (ev.isSidechain || ev.isMeta) continue;
+        if (ev.isCompactSummary === true) continue;
         const msg = ev.message;
         if (!msg) continue;
         const role = msg.role === 'assistant' ? 'assistant' : 'user';
-        const text = textOf(msg.content, role);
+        let text = textOf(msg.content);
         if (!text) continue;
-        if (role === 'user' && /^<(command-name|local-command-stdout|command-message)>/.test(text)) continue;
+        if (role === 'user') {
+          text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
+          if (!text) continue;
+          if (INJECTED.test(text) || text.startsWith('This session is being continued from a previous conversation') || text.startsWith('[Request interrupted by user')) continue;
+        }
         if (ev.sessionId) sessionId = ev.sessionId;
         if (ev.cwd) cwd = ev.cwd;
         const t = Date.parse(ev.timestamp);
@@ -812,25 +985,6 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       if (!messages.length) return null;
       return { source: 'claude-code', externalId: sessionId, title: customTitle || aiTitle || summary || undefined, workspace: cwd, messages, ingestMethod: 'local' };
     };
-
-    await t('1 stream', 'claude-code：空行/坏行/末行无换行，新旧结果一致', async () => {
-      const f = put('claude/cc-stream.jsonl', [
-        j({ type: 'summary', summary: '流式摘要' }),
-        '',
-        '{"type":"user", bad',
-        j({ type: 'user', sessionId: 'cc-stream', cwd: '/w/cc', timestamp: '2026-11-01T00:00:00Z', message: { role: 'user', content: '流式问题' } }),
-        j({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: '回答一' }, { type: 'thinking', thinking: 'x' }] } }),
-        j({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: '回答二' }, { type: 'tool_use', name: 'Bash', input: { cmd: 'ls' } }] } }),
-        j({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'Y'.repeat(1000) }] } }),
-        j({ type: 'user', isSidechain: true, message: { role: 'user', content: '旁支' } }),
-        j({ type: 'user', message: { role: 'user', content: '<command-name>/clear</command-name>' } }),
-        '',
-        j({ type: 'user', message: { role: 'user', content: '最后一行无换行' } }),
-      ].join('\n'));
-      const now = await ADAPTERS['claude-code'].read(f);
-      same(now, await oldClaude(f));
-      assert.ok(now && now.messages.length >= 3);
-    });
 
     // 旧实现：codex（含标题索引）
     const oldCodex = (() => {
@@ -1308,10 +1462,30 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       const count = store.db.prepare("SELECT COUNT(*) n FROM messages WHERE conversation_id=(SELECT id FROM conversations WHERE external_id='u1')").get().n;
       assert.equal(count, 2);
     });
-    await t('2b upsert', '非 authoritative 不截断；同内容重复写不产生变更', () => {
+    await t('2b upsert', 'Claude Code 非 authoritative 也按完整快照截断；其它本地来源与网页非 align 不截断；同内容重复写不产生变更', () => {
       const r = up('u1', L(2).slice(0, 1));
-      assert.deepEqual([r.changed, r.added], [false, 0]);
-      assert.deepEqual(rows('u1'), ['0:user:m0', '1:assistant:m1']);
+      assert.deepEqual([r.changed, r.added], [true, 0]);
+      assert.deepEqual(rows('u1'), ['0:user:m0']);
+      assert.equal(store.db.prepare("SELECT message_count FROM conversations WHERE source='claude-code' AND external_id='u1'").get().message_count, 1);
+      const r2 = up('u1', L(2).slice(0, 1));
+      assert.deepEqual([r2.changed, r2.added], [false, 0]);
+      // 网页来源未声明 authoritative 时维持旧行为，不截断
+      const W = (ext, n) => store.upsertConversation({
+        source: 'gemini-web', externalId: ext, ingestMethod: 'browser-extension',
+        messages: Array.from({ length: n }, (_, i) => ({ role: 'user', content: `${ext}-${i}` })),
+      });
+      const C = (ext, n) => store.upsertConversation({
+        source: 'codex', externalId: ext, ingestMethod: 'local',
+        messages: Array.from({ length: n }, (_, i) => ({ role: 'user', content: `${ext}-${i}` })),
+      });
+      C('codex-keep', 3);
+      C('codex-keep', 1);
+      const cid = store.db.prepare("SELECT id FROM conversations WHERE external_id='codex-keep'").get().id;
+      assert.equal(msgs(store, cid).length, 3);
+      W('no-trunc', 3);
+      W('no-trunc', 1);
+      const id = store.db.prepare("SELECT id FROM conversations WHERE external_id='no-trunc'").get().id;
+      assert.equal(msgs(store, id).length, 3);
     });
     await t('2b upsert', 'upsert 不把旧正文整份读进数组（无全表 .all()）', () => {
       const list = L(50);

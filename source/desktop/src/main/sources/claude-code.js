@@ -3,6 +3,7 @@
  * Claude Code：~/.claude/projects/<编码后的项目路径>/<sessionId>.jsonl
  * 每行一个事件：{ type: 'user'|'assistant'|'summary'|..., message: { role, content }, sessionId, timestamp, cwd, isSidechain, isMeta }
  * content 可以是字符串，也可以是 [{type:'text',text}, {type:'tool_use',...}, {type:'tool_result',...}, {type:'thinking',...}]
+ * 只保留用户和 AI 的正文：工具调用/结果/思考/系统注入全部丢弃。
  */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -24,24 +25,37 @@ async function discover(root) {
   return out;
 }
 
-function textOf(content, role) {
+// 以这些标签开头的 user 文本是 Claude Code 注入的命令/通知，不是用户正文
+const INJECTED_TAG = /^<(command-name|command-message|command-args|local-command-stdout|local-command-stderr|bash-input|bash-stdout|bash-stderr|task-notification|user-memory-input)>/;
+// 压缩上下文时生成的续接摘要
+const CONTINUED_PREFIX = 'This session is being continued from a previous conversation';
+// 用户中断提示（含 for tool use 变体）
+const INTERRUPTED_PREFIX = '[Request interrupted by user';
+
+function textOf(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   const parts = [];
+  let hasImage = false;
   for (const b of content) {
     if (!b || typeof b !== 'object') continue;
+    // 只取正文；tool_use / tool_result / thinking / redacted_thinking 一律丢弃
     if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text);
-    else if (b.type === 'tool_use') parts.push(`[调用工具 ${b.name}] ${clip(JSON.stringify(b.input ?? {}), 400)}`);
-    // tool_result 通常是大段文件内容/命令输出，只保留开头，避免把库撑爆
-    else if (b.type === 'tool_result' && role === 'user') {
-      const t = typeof b.content === 'string' ? b.content : Array.isArray(b.content) ? b.content.map((x) => x?.text || '').join('\n') : '';
-      if (t) parts.push(`[工具结果] ${clip(t, 400)}`);
-    }
+    else if (b.type === 'image') hasImage = true;
   }
-  return parts.join('\n').trim();
+  const text = parts.join('\n').trim();
+  // 没有文字时才用 [图片] 占位，避免纯图片消息被整条丢掉
+  return text || (hasImage ? '[图片]' : '');
 }
 
-function clip(s, n) { return s.length > n ? s.slice(0, n) + '…' : s; }
+// 删掉正文里夹带的 <system-reminder>…</system-reminder>（可多段、可跨行）
+function stripReminders(text) {
+  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
+}
+
+function isInjectedUserText(text) {
+  return INJECTED_TAG.test(text) || text.startsWith(CONTINUED_PREFIX) || text.startsWith(INTERRUPTED_PREFIX);
+}
 
 async function read(file) {
   const messages = [];
@@ -60,13 +74,18 @@ async function read(file) {
     if (ev.type === 'ai-title' && typeof ev.aiTitle === 'string') { aiTitle = ev.aiTitle; continue; }
     if (ev.type !== 'user' && ev.type !== 'assistant') continue;
     if (ev.isSidechain || ev.isMeta) continue;
+    // 压缩上下文生成的摘要事件，不是真实对话
+    if (ev.isCompactSummary === true) continue;
     const msg = ev.message;
     if (!msg) continue;
     const role = msg.role === 'assistant' ? 'assistant' : 'user';
-    const text = textOf(msg.content, role);
+    let text = textOf(msg.content);
     if (!text) continue;
-    // 过滤 Claude Code 注入的命令包装
-    if (role === 'user' && /^<(command-name|local-command-stdout|command-message)>/.test(text)) continue;
+    if (role === 'user') {
+      text = stripReminders(text).trim();
+      // 只剩工具结果/命令包装/中断提示/续接摘要时整条丢弃
+      if (!text || isInjectedUserText(text)) continue;
+    }
     if (ev.sessionId) sessionId = ev.sessionId;
     if (ev.cwd) cwd = ev.cwd;
     const ts = Date.parse(ev.timestamp);

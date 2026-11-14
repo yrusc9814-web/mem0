@@ -155,6 +155,19 @@ class Store {
     this.db.prepare('INSERT INTO kv(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').run(k, v);
   }
 
+  /**
+   * 0.5.5 F2：一次性清掉 Claude Code 的文件游标，让已入库的旧会话按新解析规则重读。
+   * 用 kv 标记保证只执行一次；返回本次是否执行。
+   */
+  migrateClaudeCleanV1() {
+    if (this.getKv('claude_clean_v1')) return false;
+    return this.tx(() => {
+      this.db.prepare("DELETE FROM file_cursors WHERE source = 'claude-code'").run();
+      this.setKv('claude_clean_v1', '1');
+      return true;
+    });
+  }
+
   // ---------- 文件游标 ----------
   getCursor(p) {
     return this.db.prepare('SELECT size, mtime_ms FROM file_cursors WHERE path = ?').get(p) || null;
@@ -254,8 +267,10 @@ class Store {
         added++;
         changed = true;
       }
-      // 网页端会话被截断/编辑重发时，删掉多余尾部
-      if (conv.authoritative && oldCount > messages.length) {
+      // 网页端会话被截断/编辑重发时删掉多余尾部；
+      // Claude Code 每次读到的是完整快照，0.5.5 起解析规则会过滤掉工具内容，变短时同步删掉旧行。
+      // 其它本地来源（工具可能自行清理旧记录）和网页 align 路径保持原行为，不做截断。
+      if (oldCount > messages.length && (conv.authoritative || (source === 'claude-code' && !conv.align))) {
         this.db.prepare('DELETE FROM messages WHERE conversation_id = ? AND seq >= ?').run(id, messages.length);
         changed = true;
       }
