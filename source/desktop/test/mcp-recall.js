@@ -1,6 +1,6 @@
 'use strict';
 /**
- * 本地 MCP 双工具（list_conversations + recall）验收测试：AC-MCP1 ~ AC-MCP3 与「今天互通」计数。
+ * 本地 MCP 四工具（list_conversations + recall + get_memory_context + save_memory）验收测试：AC-MCP1 ~ AC-MCP3、J2 读写与「今天互通」计数。
  * 用法：node --no-warnings test/mcp-recall.js
  * 只在临时目录建库，经真实 Streamable HTTP（SDK 客户端）调用，不触碰真实 HOME / 端口 3790。
  */
@@ -79,9 +79,9 @@ up({ source: 'zcode', externalId: 'multi', ingestMethod: 'local', title: '缓存
   const txt = (r) => r.content[0].text;
 
   // =================== AC-MCP1 ===================
-  await t('AC-MCP1', 'tools/list 仅 list_conversations 与 recall；旧工具已移除', async () => {
+  await t('AC-MCP1', 'tools/list 为 4 个工具；旧工具已移除', async () => {
     const { tools } = await client.listTools();
-    assert.deepEqual(tools.map((x) => x.name).sort(), ['list_conversations', 'recall']);
+    assert.deepEqual(tools.map((x) => x.name).sort(), ['get_memory_context', 'list_conversations', 'recall', 'save_memory']);
     for (const old of ['search_conversations', 'read_conversation']) {
       const r = await call(old, { query: 'x', id: 'x' });
       assert.ok(r.isError, `${old} 应不存在`);
@@ -99,7 +99,11 @@ up({ source: 'zcode', externalId: 'multi', ingestMethod: 'local', title: '缓存
     assert.deepEqual(rc.inputSchema.required, ['query']);
     assert.equal(props.alternatives.maxItems, 8);
     const lc = tools.find((x) => x.name === 'list_conversations');
-    assert.deepEqual([...lc.inputSchema.required].sort(), ['from', 'to']);
+    assert.deepEqual([...(lc.inputSchema.required || [])].sort(), [], 'project 模式可免日期，from/to 不再静态必填');
+    assert.ok(lc.inputSchema.properties.project, '应提供可选 project 参数');
+    assert.equal(lc.inputSchema.properties.project.maxLength, 120);
+    assert.equal(lc.inputSchema.properties.project.minLength, 1);
+    assert.ok(lc.description.includes('project'), lc.description);
     assert.ok(Array.isArray(lc.inputSchema.properties.sources.items.enum) && lc.inputSchema.properties.sources.items.enum.includes('chatgpt-web'));
     for (const s of ['grok-web', 'hark-web']) assert.ok(lc.inputSchema.properties.sources.items.enum.includes(s), s);
   });
@@ -423,10 +427,296 @@ up({ source: 'zcode', externalId: 'multi', ingestMethod: 'local', title: '缓存
     assert.equal(store.getMcpCallsToday(), before + 2);
   });
   await t('互通计数', '既有表结构与 SCHEMA_VERSION 不变；新表幂等创建', async () => {
-    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 1);
+    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 2);
     const tables = store.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((x) => x.name);
-    for (const n of ['conversations', 'messages', 'file_cursors', 'source_settings', 'kv', 'deleted_conversations', 'mcp_recall_delivered', 'mcp_calls_daily']) assert.ok(tables.includes(n), n);
+    for (const n of ['conversations', 'messages', 'file_cursors', 'source_settings', 'kv', 'deleted_conversations', 'mcp_recall_delivered', 'mcp_calls_daily', 'projects', 'memories']) assert.ok(tables.includes(n), n);
     store.ensureMcpTables(); store.ensureMcpTables();
+  });
+
+  // =================== J1：事项筛选与 recall 记忆卡/事项简报 ===================
+  await t('J1 事项目录', 'list_conversations 按事项 ID/名称筛选，输出事项名与摘要', async () => {
+    const proj = store.saveProject({ name: 'J1 事项筛选验证', state: '推进中', workspace: '/work/j1-mcp' });
+    const a = store.upsertConversation({
+      source: 'claude-code', externalId: 'j1-proj-a', ingestMethod: 'local', title: 'J1 事项会话甲',
+      workspace: '/work/j1-mcp',
+      messages: [
+        { role: 'user', content: 'J1 事项甲：订单缓存重构的讨论。', createdAt: at(2026, 5, 10, 9, 0) },
+        { role: 'assistant', content: 'J1 事项甲：建议分阶段迁移。', createdAt: at(2026, 5, 10, 9, 1) },
+      ],
+    }).id;
+    const b = store.upsertConversation({
+      source: 'codex', externalId: 'j1-proj-b', ingestMethod: 'local', title: 'J1 事项会话乙',
+      workspace: '/work/j1-mcp/sub',
+      messages: [
+        { role: 'user', content: 'J1 事项乙：灰度发布方案。', createdAt: at(2026, 5, 11, 14, 0) },
+        { role: 'assistant', content: 'J1 事项乙：先小流量验证。', createdAt: at(2026, 5, 11, 14, 1) },
+      ],
+    }).id;
+    store.updateConversationMeta(a, { summary: 'J1 摘要甲：缓存架构已定稿。' });
+    assert.equal(store.getConversation(a).project_id, proj.id, '工作区自动归属');
+    assert.equal(store.getConversation(b).project_id, proj.id, '子目录自动归属');
+    const byId = txt(await call('list_conversations', { project: proj.id }));
+    assert.ok(!byId.includes('没有找到'), byId);
+    assert.ok(byId.includes('J1 事项会话甲') && byId.includes('J1 事项会话乙'), byId);
+    assert.ok(!byId.includes('检索方案第 1 轮'), '不应混入无关会话');
+    assert.ok(byId.includes('· 事项：J1 事项筛选验证'), byId);
+    assert.ok(byId.includes('\n  摘要：J1 摘要甲：缓存架构已定稿。'), byId);
+    assert.ok(byId.includes('## 2026-05-10') && byId.includes('## 2026-05-11'), byId);
+    const byName = txt(await call('list_conversations', { project: 'j1 事项筛选' }));
+    assert.ok(byName.includes('J1 事项会话甲') && byName.includes('J1 事项会话乙'), byName);
+    const none = txt(await call('list_conversations', { project: '完全不存在的事项 zxqv' }));
+    assert.ok(none.includes('没有找到'), none);
+  });
+  await t('J1 事项目录', '传入 project 时 from/to 可选；无 project 的坏参数仍全部 isError', async () => {
+    assert.ok(!(await call('list_conversations', { project: 'J1 事项筛选' })).isError);
+    assert.ok(!(await call('list_conversations', { project: 'J1 事项筛选', from: '2026-05-01', to: '2026-05-31' })).isError);
+    const bad = [
+      {}, { from: '2026-10-01' }, { to: '2026-10-01' },
+      { from: '2026-02-30', to: '2026-03-01' }, { from: '2026-13-01', to: '2026-13-02' },
+      { from: '2026-1-01', to: '2026-01-02' }, { from: '上周', to: '本周' }, { from: '', to: '' },
+      { from: '2026-10-10', to: '2026-10-01' }, { from: '2026-10-01', to: '2026-11-02' },
+      { from: '2026-10-01', to: '2026-10-02', sources: ['evil-web'] },
+    ];
+    for (const a of bad) assert.ok((await call('list_conversations', a)).isError, JSON.stringify(a));
+    assert.ok((await call('list_conversations', { project: 'J1 事项筛选', from: '2026-05-10', to: '2026-05-01' })).isError, 'project 模式 to<from 仍拦截');
+    assert.ok((await call('list_conversations', { project: 'J1 事项筛选', from: '2026-02-30' })).isError, 'project 模式非法日期仍拦截');
+  });
+  await t('J1 recall 卡片', 'recall 同时召回记忆卡与推进事项，证据块前输出且同 process_id 不重复', async () => {
+    const mem = store.saveMemory({
+      group: '踩坑与经验库', title: 'J1 去重卡片 Alpha',
+      body: 'ZXQJ1TOKEN 记忆卡正文：MCP 去重验证，第二次不应重复。', tags: ['J1', '去重'],
+    });
+    store.saveMemory({
+      group: '环境与工作流', title: 'J1 环境卡片',
+      body: 'ZXQJ1ENV 环境约定：Windows 下使用 PowerShell。', tags: [],
+    });
+    const proj = store.saveProject({
+      name: 'J1 召回事项 Beta', state: '待验证',
+      progress: 'ZXQJ1TOKEN 事项进展：卡片与简报同时召回。',
+      decisions: ['拍板：使用 mcp_recall_delivered 去重'],
+      rejected: ['否决：同 process_id 重复刷屏'], nextStep: '补充 MCP 单测',
+    });
+    const P = 'j1-cards-' + Date.now();
+    const r = txt(await call('recall', { query: 'ZXQJ1TOKEN 向量数据库', process_id: P }));
+    assert.ok(r.includes('【记忆卡 · 踩坑与经验库】J1 去重卡片 Alpha'), r);
+    assert.ok(r.includes('ZXQJ1TOKEN 记忆卡正文'), r);
+    assert.ok(r.includes('【推进事项 · J1 召回事项 Beta】'), r);
+    assert.ok(r.includes('已否决：否决：同 process_id 重复刷屏'), r);
+    assert.ok(r.includes('下一步：补充 MCP 单测'), r);
+    assert.ok(blocks(r).length >= 1, '原文证据仍照常交付：' + r);
+    assert.ok(r.indexOf('【记忆卡 · 踩坑与经验库】') < r.indexOf('【1】'), '卡片应在证据块之前');
+    const rows = store.db.prepare('SELECT msg_id FROM mcp_recall_delivered WHERE process_id = ?').all(P).map((x) => x.msg_id);
+    assert.ok(rows.includes('mem:' + mem.id), rows.join(','));
+    assert.ok(rows.includes('proj:' + proj.id), rows.join(','));
+    const again = txt(await call('recall', { query: 'ZXQJ1TOKEN 向量数据库', process_id: P }));
+    assert.ok(!again.includes('【记忆卡 · 踩坑与经验库】'), again);
+    assert.ok(!again.includes('【推进事项 · J1 召回事项 Beta】'), again);
+    const envOut = txt(await call('recall', { query: 'ZXQJ1ENV', process_id: 'j1-env-' + Date.now() }));
+    assert.ok(envOut.includes('【记忆卡 · 环境与工作流】J1 环境卡片'), envOut);
+    const onlyPid = 'j1-cards-only-' + Date.now();
+    const cardsOnly = txt(await call('recall', { query: 'ZXQJ1TOKEN', process_id: onlyPid }));
+    assert.ok(cardsOnly.includes('【记忆卡 · 踩坑与经验库】') && cardsOnly.includes('【推进事项 · J1 召回事项 Beta】'), cardsOnly);
+    assert.equal(blocks(cardsOnly).length, 0, '仅命中卡片/事项时没有原文证据块');
+    assert.ok(cardsOnly.includes('本轮未找到新的对话原文片段'), cardsOnly);
+    const cardsAgain = txt(await call('recall', { query: 'ZXQJ1TOKEN', process_id: onlyPid }));
+    assert.ok(!cardsAgain.includes('【记忆卡') && !cardsAgain.includes('【推进事项'), cardsAgain);
+    assert.ok(cardsAgain.includes('未找到'), cardsAgain);
+  });
+
+  // =================== J2：get_memory_context 与 save_memory ===================
+  await t('J2 工具', '两个新工具入参 schema 与 SPEC 一致（enum/长度/describe 文案）', async () => {
+    const { tools } = await client.listTools();
+    assert.deepEqual(tools.map((x) => x.name).sort(), ['get_memory_context', 'list_conversations', 'recall', 'save_memory']);
+    const gm = tools.find((x) => x.name === 'get_memory_context');
+    assert.deepEqual(Object.keys(gm.inputSchema.properties).sort(), ['groups', 'include_archived', 'project', 'tag']);
+    assert.deepEqual([...(gm.inputSchema.required || [])], [], '空参概览：四个参数全部可选');
+    assert.deepEqual(gm.inputSchema.properties.groups.items.enum, ['个人与职业背景', '协作与沟通准则', '环境与工作流', '踩坑与经验库']);
+    assert.equal(gm.inputSchema.properties.groups.maxItems, 4);
+    assert.equal(gm.inputSchema.properties.project.description, '可选，推进事项的 ID 或名称关键字，拉取该事项的进展、拍板结论、已否决方案与关联会话列表');
+    assert.equal(gm.inputSchema.properties.project.maxLength, 120);
+    assert.equal(gm.inputSchema.properties.tag.description, '可选，配合「踩坑与经验库」按标签过滤卡片');
+    assert.equal(gm.inputSchema.properties.tag.maxLength, 50);
+    assert.equal(gm.inputSchema.properties.include_archived.description, '可选，未指定具体事项时列出事项索引是否包含已结项归档事项，默认 false');
+    const sm = tools.find((x) => x.name === 'save_memory');
+    assert.deepEqual(sm.inputSchema.required, ['target_type']);
+    assert.deepEqual(Object.keys(sm.inputSchema.properties).sort(), ['archived', 'body', 'card_id', 'decisions', 'group', 'next_step', 'progress', 'project', 'rejected', 'state', 'tags', 'target_type', 'title', 'workspace']);
+    assert.deepEqual(sm.inputSchema.properties.target_type.enum, ['card', 'project']);
+    assert.deepEqual(sm.inputSchema.properties.group.enum, ['个人与职业背景', '协作与沟通准则', '环境与工作流', '踩坑与经验库']);
+    assert.equal(sm.inputSchema.properties.card_id.description, '可选，更新已有卡片时传入卡片 id；未传但同模块存在同名 title 时自动更新原卡并保留旧版记录');
+    assert.equal(sm.inputSchema.properties.title.maxLength, 120);
+    assert.equal(sm.inputSchema.properties.body.maxLength, 8000);
+    assert.equal(sm.inputSchema.properties.tags.maxItems, 10);
+    assert.equal(sm.inputSchema.properties.decisions.description, '可选，追加到事项「已拍板结论」的条目（自动去重）');
+    assert.equal(sm.inputSchema.properties.rejected.description, '可选，追加到事项「已否决方案」的条目（自动去重）');
+    assert.equal(sm.inputSchema.properties.next_step.maxLength, 500);
+    const ins = client.getInstructions();
+    assert.ok(ins.includes('get_memory_context') && ins.includes('save_memory'), ins);
+  });
+
+  await t('J2 save_memory', 'card 新建 origin_label=MCP 写入；同名更新复用原卡并把旧正文存入 superseded', async () => {
+    const r1 = await call('save_memory', { target_type: 'card', group: '踩坑与经验库', title: 'J2 MCP 经验卡', body: 'J2 旧版正文：首次写入。', tags: ['J2', 'MCP'] });
+    assert.ok(!r1.isError, txt(r1));
+    assert.ok(txt(r1).includes('已新建常驻卡片：J2 MCP 经验卡'), txt(r1));
+    const card = store.listMemories({ group: '踩坑与经验库' }).find((m) => m.title === 'J2 MCP 经验卡');
+    assert.ok(card, '应写入卡片');
+    assert.equal(card.originLabel, 'MCP 写入');
+    assert.deepEqual(card.tags, ['J2', 'MCP']);
+    assert.equal(card.superseded, '');
+    const r2 = await call('save_memory', { target_type: 'card', group: '踩坑与经验库', title: 'J2 MCP 经验卡', body: 'J2 新版正文：同名更新。' });
+    assert.ok(!r2.isError, txt(r2));
+    const updated = store.getMemory(card.id);
+    assert.equal(updated.id, card.id, '同名卡应复用 id');
+    assert.equal(updated.body, 'J2 新版正文：同名更新。');
+    assert.equal(updated.superseded, 'J2 旧版正文：首次写入。');
+    assert.equal(updated.originLabel, 'MCP 写入');
+    assert.deepEqual(updated.tags, ['J2', 'MCP'], '未传 tags 时保留原标签');
+    const r3 = await call('save_memory', { target_type: 'card', group: '环境与工作流', card_id: card.id, title: 'J2 MCP 经验卡（迁移）', body: 'J2 迁移后的正文。', tags: ['J2'] });
+    assert.ok(!r3.isError, txt(r3));
+    const moved = store.getMemory(card.id);
+    assert.equal(moved.group, '环境与工作流');
+    assert.equal(moved.title, 'J2 MCP 经验卡（迁移）');
+    assert.equal(moved.superseded, 'J2 新版正文：同名更新。');
+    assert.deepEqual(moved.tags, ['J2']);
+  });
+
+  await t('J2 save_memory', 'project 新建/增量更新：decisions 与 rejected 追加去重，未传字段保持原值', async () => {
+    const r1 = await call('save_memory', { target_type: 'project', project: 'J2 MCP 联调事项', state: '推进中', workspace: '/work/j2-mcp', progress: 'J2 首次进展', decisions: ['J2 拍板甲', 'J2 拍板乙'], rejected: ['J2 否决甲'], next_step: 'J2 首次下一步' });
+    assert.ok(!r1.isError, txt(r1));
+    assert.ok(txt(r1).includes('已新建推进事项：J2 MCP 联调事项'), txt(r1));
+    const p = store.listProjects({ includeArchived: true }).find((x) => x.name === 'J2 MCP 联调事项');
+    assert.ok(p, '应新建事项');
+    assert.equal(p.state, '推进中');
+    assert.equal(p.workspace, '/work/j2-mcp');
+    assert.deepEqual(p.decisions, ['J2 拍板甲', 'J2 拍板乙']);
+    assert.deepEqual(p.rejected, ['J2 否决甲']);
+    const conv = store.upsertConversation({
+      source: 'claude-code', externalId: 'j2-mcp-conv', ingestMethod: 'local', title: 'J2 事项关联会话',
+      workspace: '/work/j2-mcp',
+      messages: [
+        { role: 'user', content: 'J2 关联会话：联调事项上下文。', createdAt: at(2026, 4, 2, 10, 0) },
+        { role: 'assistant', content: 'J2 关联会话：已写入联调事项。', createdAt: at(2026, 4, 2, 10, 1) },
+      ],
+    });
+    assert.equal(store.getConversation(conv.id).project_id, p.id, '工作区自动归属');
+    const r2 = await call('save_memory', { target_type: 'project', project: 'j2 mcp 联调', state: '待验证', progress: 'J2 第二次进展', decisions: ['J2 拍板乙', 'J2 拍板丙'], rejected: ['J2 否决甲', 'J2 否决乙'], next_step: 'J2 第二次下一步', archived: true });
+    assert.ok(!r2.isError, txt(r2));
+    assert.ok(txt(r2).includes('已更新推进事项：J2 MCP 联调事项'), txt(r2));
+    const p2 = store.getProject(p.id);
+    assert.equal(p2.state, '待验证');
+    assert.equal(p2.progress, 'J2 第二次进展');
+    assert.deepEqual(p2.decisions, ['J2 拍板甲', 'J2 拍板乙', 'J2 拍板丙'], '追加去重且保持顺序');
+    assert.deepEqual(p2.rejected, ['J2 否决甲', 'J2 否决乙']);
+    assert.equal(p2.nextStep, 'J2 第二次下一步');
+    assert.equal(p2.archived, true);
+    assert.equal(p2.workspace, '/work/j2-mcp', '未传 workspace 保持原值');
+    assert.equal(store.listProjects({ includeArchived: true }).filter((x) => x.name === 'J2 MCP 联调事项').length, 1, '按名称匹配更新而非重复新建');
+  });
+
+  await t('J2 save_memory', '坏参数全部 isError：缺 target_type / card 缺 group/title/body / 非法分组 / 缺 project / 不存在的 card_id', async () => {
+    const bad = [
+      {},
+      { target_type: 'nope' },
+      { target_type: 'card' },
+      { target_type: 'card', title: 't', body: 'b' },
+      { target_type: 'card', group: '踩坑与经验库', body: 'b' },
+      { target_type: 'card', group: '踩坑与经验库', title: 't' },
+      { target_type: 'card', group: '不存在的分组', title: 't', body: 'b' },
+      { target_type: 'card', group: '踩坑与经验库', title: 't', body: 'b', card_id: 'no-such-card' },
+      { target_type: 'project' },
+      { target_type: 'project', project: '' },
+      { target_type: 'project', project: 'x', decisions: [''] },
+      { target_type: 'card', group: '踩坑与经验库', title: 't', body: 'b', tags: Array(11).fill('x') },
+    ];
+    for (const a of bad) {
+      const r = await call('save_memory', a);
+      assert.ok(r.isError, `应拦截 ${JSON.stringify(a)}`);
+    }
+    const missing = await call('save_memory', { target_type: 'card', group: '踩坑与经验库', title: '缺正文' });
+    assert.ok(txt(missing).includes('body 必填'), txt(missing));
+  });
+
+  await t('J2 get_memory_context', '空参概览：4 个模块卡片数量 + 活跃事项 id/名称/状态/进展，不含卡片正文', async () => {
+    const r = txt(await call('get_memory_context', {}));
+    for (const g of ['个人与职业背景', '协作与沟通准则', '环境与工作流', '踩坑与经验库']) assert.ok(r.includes(`- ${g}：`), r);
+    assert.ok(r.includes('## 活跃推进事项'), r);
+    assert.ok(r.includes('J1 事项筛选验证'), r);
+    assert.ok(!r.includes('J2 MCP 联调事项'), '已归档事项默认不列出：' + r);
+    assert.ok(r.includes('get_memory_context'), r);
+    assert.ok(!r.includes('J1 摘要甲'), '概览不含卡片正文');
+    const withArchived = txt(await call('get_memory_context', { include_archived: true }));
+    assert.ok(withArchived.includes('J2 MCP 联调事项'), withArchived);
+    assert.ok(withArchived.includes('## 推进事项（含已结项）'), withArchived);
+  });
+
+  await t('J2 get_memory_context', '按 groups 读取卡片 Markdown（标题/标签/正文），tag 过滤踩坑库', async () => {
+    store.saveMemory({ group: '踩坑与经验库', title: 'J2 标签卡甲', body: 'J2TAGONE 正文甲。', tags: ['J2TAG', '甲'] });
+    store.saveMemory({ group: '踩坑与经验库', title: 'J2 标签卡乙', body: 'J2TAGTWO 正文乙。', tags: ['其他'] });
+    const all = txt(await call('get_memory_context', { groups: ['踩坑与经验库'] }));
+    assert.ok(all.includes('# 踩坑与经验库（'), all);
+    assert.ok(all.includes('## J2 标签卡甲') && all.includes('J2TAGONE 正文甲。'), all);
+    assert.ok(all.includes('## J2 标签卡乙') && all.includes('J2TAGTWO 正文乙。'), all);
+    assert.ok(all.includes('标签：J2TAG、甲'), all);
+    const filtered = txt(await call('get_memory_context', { groups: ['踩坑与经验库'], tag: 'j2tag' }));
+    assert.ok(filtered.includes('## J2 标签卡甲') && !filtered.includes('## J2 标签卡乙'), filtered);
+    assert.ok(filtered.includes('标签过滤：j2tag'), filtered);
+    const two = txt(await call('get_memory_context', { groups: ['个人与职业背景', '环境与工作流'] }));
+    assert.ok(two.includes('# 个人与职业背景（0 张卡）') && two.includes('（本模块暂无卡片）'), two);
+    assert.ok(two.includes('# 环境与工作流（') && two.includes('J2 MCP 经验卡（迁移）'), two);
+    assert.ok((await call('get_memory_context', { groups: ['不存在的模块'] })).isError);
+    assert.ok((await call('get_memory_context', { groups: Array(5).fill('踩坑与经验库') })).isError);
+  });
+
+  await t('J2 get_memory_context', '按 project 读取完整简报：状态/工作区/进展/拍板/否决/下一步/最近关联会话', async () => {
+    const r = txt(await call('get_memory_context', { project: 'J2 MCP 联调' }));
+    assert.ok(r.includes('# 推进事项：J2 MCP 联调事项'), r);
+    assert.ok(r.includes('状态：待验证'), r);
+    assert.ok(r.includes('归档：已结项'), r);
+    assert.ok(r.includes('工作区：/work/j2-mcp'), r);
+    assert.ok(r.includes('当前进展：J2 第二次进展'), r);
+    assert.ok(r.includes('## 已拍板结论') && r.includes('- J2 拍板甲') && r.includes('- J2 拍板丙'), r);
+    assert.ok(r.includes('## 已否决方案') && r.includes('- J2 否决乙'), r);
+    assert.ok(r.includes('## 下一步待办') && r.includes('J2 第二次下一步'), r);
+    assert.ok(r.includes('## 最近关联会话（1）') && r.includes('J2 事项关联会话'), r);
+    const p = store.listProjects({ includeArchived: true }).find((x) => x.name === 'J2 MCP 联调事项');
+    const byId = txt(await call('get_memory_context', { project: p.id }));
+    assert.ok(byId.includes('# 推进事项：J2 MCP 联调事项'), byId);
+    const none = txt(await call('get_memory_context', { project: '完全不存在的事项 zxqv' }));
+    assert.ok(none.includes('没有找到'), none);
+    const combo = txt(await call('get_memory_context', { groups: ['踩坑与经验库'], project: 'J2 MCP 联调' }));
+    assert.ok(combo.includes('# 踩坑与经验库') && combo.includes('# 推进事项：J2 MCP 联调事项'), combo);
+  });
+
+  await t('J2 recall', 'recall 同时召回 save_memory 写入的卡片与事项简报，同 process_id 不重复', async () => {
+    store.saveMemory({ group: '踩坑与经验库', title: 'J2 召回卡', body: 'ZXQJ2MCP 召回正文：卡片与简报同时命中。', tags: ['J2'] });
+    store.saveProject({ name: 'J2 召回事项', state: '推进中', progress: 'ZXQJ2MCP 事项进展。', decisions: ['J2 召回拍板'], rejected: ['J2 召回否决'], nextStep: 'J2 召回下一步' });
+    const P = 'j2-recall-' + Date.now();
+    const r = txt(await call('recall', { query: 'ZXQJ2MCP', process_id: P }));
+    assert.ok(r.includes('【记忆卡 · 踩坑与经验库】J2 召回卡'), r);
+    assert.ok(r.includes('【推进事项 · J2 召回事项】'), r);
+    assert.ok(r.includes('已否决：J2 召回否决'), r);
+    const again = txt(await call('recall', { query: 'ZXQJ2MCP', process_id: P }));
+    assert.ok(!again.includes('【记忆卡 · 踩坑与经验库】J2 召回卡'), again);
+    assert.ok(!again.includes('【推进事项 · J2 召回事项】'), again);
+  });
+
+  await t('J2 事件', "save_memory 写入成功 emit('mutated')；失败调用不 emit", async () => {
+    const events = [];
+    const on = (e) => events.push(e);
+    mcpEvents.on('mutated', on);
+    try {
+      const r = await call('save_memory', { target_type: 'card', group: '踩坑与经验库', title: 'J2 事件卡', body: 'J2 事件正文。' });
+      assert.ok(!r.isError, txt(r));
+      assert.equal(events.length, 1, JSON.stringify(events));
+      assert.equal(events[0].target, 'card');
+      assert.ok(events[0].id);
+      const pj = await call('save_memory', { target_type: 'project', project: 'J2 事件事项', progress: 'J2 事件进展' });
+      assert.ok(!pj.isError, txt(pj));
+      assert.equal(events.length, 2, JSON.stringify(events));
+      assert.equal(events[1].target, 'project');
+      const bad = await call('save_memory', { target_type: 'card', group: '踩坑与经验库', title: '缺正文' });
+      assert.ok(bad.isError);
+      assert.equal(events.length, 2, '失败调用不应 emit mutated');
+    } finally { mcpEvents.off('mutated', on); }
   });
 
   await client.close();

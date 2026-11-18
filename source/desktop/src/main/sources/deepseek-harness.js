@@ -57,11 +57,25 @@ function textOf(content) {
   return parts.join('\n').trim();
 }
 
+// 正文保留的块类型；reasoning / tool_use / tool_result 等其余块全部计入降噪统计
+const RETAINED_BLOCKS = new Set(['text', 'file', 'image']);
+
+function strippedBlocksOf(content) {
+  if (!Array.isArray(content)) return 0;
+  let n = 0;
+  for (const b of content) {
+    if (!b || typeof b !== 'object') continue;
+    if (!RETAINED_BLOCKS.has(b.type)) n++;
+  }
+  return n;
+}
+
 async function read(file) {
   let header;
   let seenHeader = false;
   const messages = [];
   let title;
+  let strippedBlocks = 0;
   for await (const line of readLines(file, file.endsWith('.zstd') ? { decompress: zstd } : undefined)) {
     if (!seenHeader) {
       seenHeader = true;
@@ -77,10 +91,11 @@ async function read(file) {
     if (!data || typeof data !== 'object') continue;
     if (row.type === 'session/title' && typeof data.title === 'string') { title = data.title; continue; }
     if (row.type !== 'user/message' && row.type !== 'assistant/message') continue;
-    if (row.surfaceOp !== 'append') continue;
+    if (row.surfaceOp !== 'append') { strippedBlocks++; continue; } // 替换控制事件
     const role = row.type === 'user/message' ? 'user' : 'assistant';
     const msg = role === 'user' ? data : (data.message || data);
-    if (role === 'user' && msg.source && msg.source.kind !== 'user') continue; // 系统注入
+    if (role === 'user' && msg.source && msg.source.kind !== 'user') { strippedBlocks++; continue; } // 系统注入
+    strippedBlocks += strippedBlocksOf(msg.content);
     const text = textOf(msg.content);
     if (!text) continue;
     const ts = Number.isFinite(row.time) ? row.time : undefined;
@@ -93,7 +108,7 @@ async function read(file) {
   return {
     source: ID, externalId: header.id, title, workspace: header.cwd || null,
     createdAt: Number.isFinite(header.createdAt) ? header.createdAt : undefined,
-    messages, ingestMethod: 'local',
+    messages, strippedBlocks, ingestMethod: 'local',
   };
 }
 

@@ -14,6 +14,11 @@ const h = (tag, attrs = {}, ...kids) => {
   for (const k of kids.flat()) if (k !== null && k !== undefined && k !== false) el.append(k instanceof Node ? k : document.createTextNode(String(k)));
   return el;
 };
+/** 安全替换子节点：跳过 null / undefined / false，避免原生 replaceChildren 把它们渲染成裸文字 "null" */
+const fill = (el, ...kids) => {
+  el.replaceChildren(...kids.flat().filter((k) => k !== null && k !== undefined && k !== false).map((k) => (k instanceof Node ? k : String(k))));
+  return el;
+};
 
 // ---------- 来源 ----------
 // [显示名, 图例色]。色板偏暖，避免冷蓝灰把纸感弄脏
@@ -166,6 +171,8 @@ let current = null;
 let query = '';
 let view = 'home';
 const selected = new Set(); // 来源筛选：空集合 = 全部来源
+// 记忆页 / 事项 / AI 整理等 0.6.0 新能力由 memory.js 挂到 window.mem0Ext（单测只跑本文件时为空，全部可选）
+const ext = () => window.mem0Ext || null;
 
 // ---------- 浮层通用：点击外部 / Esc 关闭 ----------
 const openPops = new Set();
@@ -180,6 +187,7 @@ function show(v) {
   $$('.nav').forEach((e) => e.classList.toggle('on', e.dataset.view === v));
   $('#btn-settings').classList.toggle('on', v === 'settings');
   if (v === 'records') renderList();
+  if (v === 'memory' && ext()) ext().renderMemory();
   reportNav();
 }
 // 上报当前页面/会话给主进程：主窗口被销毁重建后按它恢复（主进程只记这一个变量）
@@ -199,7 +207,7 @@ $('#btn-all').addEventListener('click', () => show('records'));
 function renderTheme() {
   const dark = document.documentElement.dataset.theme === 'dark';
   const b = $('#btn-theme');
-  b.replaceChildren(icon(dark ? 'sun' : 'moon'));
+  fill(b, icon(dark ? 'sun' : 'moon'));
   b.title = dark ? '切换到浅色' : '切换到深色';
   $$('#theme-seg button').forEach((x) => x.classList.toggle('on', x.dataset.themeOpt === mem0Theme.get()));
 }
@@ -224,17 +232,17 @@ function legendItem(id, pct) {
 }
 function renderLegend(entries) {
   const legend = $('#storage-legend');
-  if (!entries.length) { legend.replaceChildren(h('span', { class: 'sub' }, '还没有备份的对话')); return; }
+  if (!entries.length) { fill(legend, h('span', { class: 'sub' }, '还没有备份的对话')); return; }
   const pcts = percents(entries.map((e) => e[1]));
   const items = entries.map(([id], i) => [id, pcts[i]]);
   const top = items.slice(0, 4).map(([id, p]) => legendItem(id, p));
   const rest = items.slice(4);
-  if (!rest.length) { legend.replaceChildren(...top); return; }
+  if (!rest.length) { fill(legend, ...top); return; }
   const pop = h('div', { class: 'pop legend-pop', role: 'tooltip', id: 'legend-more-pop' },
     ...rest.map(([id, p]) => h('div', { class: 'lp-row', 'data-source': id }, h('i', { class: 'sw', style: { background: srcColor(id) } }), srcLabel(id), h('span', { class: 'pct' }, `${p}%`))));
   const more = h('span', { class: 'lg-more-wrap' },
     h('button', { class: 'lg-more', type: 'button', 'aria-describedby': 'legend-more-pop', title: `另外 ${rest.length} 个来源` }, `+${rest.length}`), pop);
-  legend.replaceChildren(...top, more);
+  fill(legend, ...top, more);
 }
 
 /** 今日 MCP 被读取次数（主进程实时推送 + 每次 state 刷新） */
@@ -255,23 +263,23 @@ async function renderHome() {
   const sideA = connected[0] ? connected[0].id : s.clients[0] && s.clients[0].id;
   const sideB = connected[1] ? connected[1].id : s.clients[1] && s.clients[1].id;
   const ln = (dir) => h('span', { class: `ln ${dir}` }, h('i', { class: 'flow-dot' }));
-  flow.replaceChildren(
+  fill(flow, 
     sideA ? av(sideA, 'sm') : '', ln('l'), h('span', { class: 'hub' }, brandMark()), ln('r'), sideB ? av(sideB, 'sm') : '',
     h('span', { class: 'go' }, connected.length ? '管理 ›' : '一键连接 ›'));
   renderMcpToday(s.mcpCallsToday);
   $('#mcp-sub').textContent = s.services.mcp.starting ? '本地 MCP 启动中…' : !s.services.mcp.ok ? `本地 MCP 未启动：${s.services.mcp.error || '未知原因'}`
-    : connected.length ? `本地 MCP 运行中，${connected.map((c) => c.label).join('、')} 可直接查你的历史对话`
-      : '本地 MCP 运行中，连接后 Claude Code、Codex 等可直接查你的历史对话';
+    : connected.length ? `本地 MCP 运行中，${connected.map((c) => c.label).join('、')} 可按需读写你的记忆与历史对话`
+      : '本地 MCP 运行中，连接后 Claude Code、Codex 等可按需读写你的记忆与历史对话';
 
   $('#total-msgs').textContent = nf.format(st.messages);
   $('#total-convs').textContent = `条消息 · ${nf.format(st.total)} 个对话`;
   const entries = Object.entries(st.messagesBySource || {}).filter((e) => e[1] > 0).sort((a, b) => b[1] - a[1]);
-  $('#storage-bar').replaceChildren(...entries.map(([id, n]) => h('i', { title: `${srcName(id)} ${nf.format(n)}`, 'data-source': id, style: { flex: String(n), background: srcColor(id) } })));
+  fill($('#storage-bar'), ...entries.map(([id, n]) => h('i', { title: `${srcName(id)} ${nf.format(n)}`, 'data-source': id, style: { flex: String(n), background: srcColor(id) } })));
   renderLegend(entries);
 
   const rows = await mem0.list({ limit: 6 });
   const tl = $('#timeline');
-  tl.replaceChildren(...(rows.length ? rows.map((r) => h('div', { class: 'row', onclick: () => { show('records'); openConversation(r.id, []); } },
+  fill(tl, ...(rows.length ? rows.map((r) => h('div', { class: 'row', onclick: () => { show('records'); openConversation(r.id, []); } },
     av(r.source),
     h('div', { class: 'main' }, h('div', { class: 't' }, r.title || '(无标题)'), h('div', { class: 'sub' }, srcLabel(r.source), h('span', { class: 'dotsep' }, '·'), h('span', {}, `共 ${nf.format(r.message_count)} 条消息`))),
     h('div', { class: 'time' }, shortTime(r.updated_at)))) : [h('div', { class: 'empty' }, '还没有备份的对话。打开「连接」看看哪些来源已检测到。')]));
@@ -315,7 +323,7 @@ function renderFilter() {
   if (local.length) out.push(h('div', { class: 'sep', role: 'separator' }), h('div', { class: 'gh' }, '本机'), ...local.map((id) => row(id, srcLabel(id), sourceLogo(id), by[id], selected.has(id), toggleSrc(id))));
   if (web.length) out.push(h('div', { class: 'sep', role: 'separator' }), h('div', { class: 'gh' }, '浏览器插件'), ...web.map((id) => row(id, srcLabel(id), sourceLogo(id), by[id], selected.has(id), toggleSrc(id))));
   const focusedId = document.activeElement && document.activeElement.closest && document.activeElement.closest('#filter-menu') ? document.activeElement.dataset.source : null;
-  $('#filter-menu').replaceChildren(...out);
+  fill($('#filter-menu'), ...out);
   if (focusedId !== null) { const f = $(`#filter-menu .mi[data-source="${CSS.escape(focusedId)}"]`); if (f) f.focus({ preventScroll: true }); }
   $('#filter-label').textContent = filterLabel();
   $('#filter-btn').classList.toggle('active', selected.size > 0);
@@ -348,14 +356,20 @@ async function renderList() {
     const rows = await mem0.list({ sources, limit: 300 });
     if (seq !== listSeq) return;
     if (!rows.length) out.push(h('div', { class: 'empty' }, '还没有备份的对话'));
-    let g = '';
-    for (const r of rows) {
-      const d = dayLabel(r.updated_at || 0);
-      if (d !== g) { g = d; out.push(h('div', { class: 'grp' }, d)); }
-      out.push(liRow(r.id, r.source, r.title, r.updated_at, () => openConversation(r.id, [])));
+    const x = ext();
+    const rowOf = (r) => liRow(r.id, r.source, r.title, r.updated_at, () => openConversation(r.id, []), x ? x.liSub(r) : null);
+    if (x && rows.length && x.recMode() === 'project') out.push(...x.projectGroups(rows, rowOf));
+    else {
+      let g = '';
+      for (const r of rows) {
+        const d = dayLabel(r.updated_at || 0);
+        if (d !== g) { g = d; out.push(h('div', { class: 'grp' }, d)); }
+        out.push(rowOf(r));
+      }
     }
+    if (x) x.listCount(rows.length);
   }
-  list.replaceChildren(...out);
+  fill(list, ...out);
 }
 
 // ---------- 会话详情分页 ----------
@@ -456,29 +470,56 @@ async function openConversation(id, terms) {
   const pane = $('#detail');
   if (outlineCleanup) { outlineCleanup(); outlineCleanup = null; }
   const scroller = h('div', { class: 'scroller', id: 'scroller' });
-  if (!conv) { scroller.append(h('div', { class: 'empty' }, '会话已被删除')); pane.replaceChildren(scroller); return; }
+  if (!conv) { scroller.append(h('div', { class: 'empty' }, '会话已被删除')); fill(pane, scroller); return; }
   const web = isWeb(conv.source);
   const actBtn = (name, title, fn) => h('button', { class: 'icon-btn', title, 'aria-label': title, onclick: fn }, icon(name));
   const sep = () => h('span', { class: 'dotsep' }, '·');
+  // v4 部件（memory.js）：事项胶囊内联在 meta 行；会话摘要无内容时不渲染；手动修改只在库里静默锁定，界面无锁标
+  const parts = ext() ? ext().detailParts(conv) : null;
+  const hasNote = Boolean(parts && parts.hasNote);
+  const copyLabel = hasNote ? '复制摘要与全文' : '复制全文';
+  const copyBtn = h('button', { class: 'head-copy-btn', type: 'button', title: copyLabel }, icon('copy'), h('span', {}, copyLabel));
+  let copying = false;
+  copyBtn.addEventListener('click', async () => {
+    if (copying) return;
+    copying = true;
+    try {
+      // 点击时才分页取全文拼接，不在打开详情时预先拼好
+      const full = await readFullText(id);
+      // 有会话摘要时在顶部附标题与摘要；无摘要保持原有纯 ## 我 / ## AI 格式
+      const sum = String(conv.summary || '').trim();
+      await mem0.copy(sum ? `# ${conv.title || '(无标题)'}\n\n> 摘要：${sum}\n\n${full}` : full);
+      copyBtn.classList.add('done'); copyBtn.lastChild.textContent = '已复制';
+      setTimeout(() => { copyBtn.classList.remove('done'); copyBtn.lastChild.textContent = copyLabel; }, 1500);
+    } finally { copying = false; }
+  });
+  const origTitle = conv.original_title && conv.original_title !== conv.title ? conv.original_title : '';
   const track = h('div', { class: 'track thread' },
     h('div', { class: 'detail-head' },
-      h('h1', {}, conv.title || '(无标题)'),
+      h('div', { class: 'detail-title-col' },
+        h('h1', {}, conv.title || '(无标题)'),
+        origTitle ? h('div', { class: 'orig-prompt', title: `原始首句：${origTitle}` }, `原首句：${origTitle}`) : null),
       h('div', { class: 'detail-actions' },
-        conv.url ? actBtn('external', '打开原会话', () => mem0.openUrl(conv.url)) : null,
+        copyBtn,
+        parts ? actBtn('edit', hasNote ? '编辑标题与会话摘要' : '修改标题 / 添加会话摘要', parts.toggleEdit) : null,
+        conv.url ? actBtn('external', '打开原网页', () => mem0.openUrl(conv.url)) : null,
         actBtn('trash', '删除这条备份', async () => {
           // 确认框由主进程（dialog.showMessageBox）弹出，这里不再重复 confirm
           if (await mem0.remove(id)) {
             current = null; reportNav();
             // 替换详情 DOM 之前先解绑大纲（含待执行的一帧）
             if (outlineCleanup) { outlineCleanup(); outlineCleanup = null; }
-            pane.replaceChildren(h('div', { class: 'scroller' }, h('div', { class: 'empty' }, '已删除'))); state = await mem0.state(); renderAll(); renderList();
+            fill(pane, h('div', { class: 'scroller' }, h('div', { class: 'empty' }, '已删除'))); state = await mem0.state(); renderAll(); renderList();
           }
         }))),
     h('div', { class: 'meta' }, av(conv.source, 'xs'), srcLabel(conv.source), sep(),
       h('span', {}, `${web ? '上次抓取' : '上次活动'} ${fullTime(conv.updated_at)}`), sep(),
       h('span', {}, `${nf.format(conv.message_count)} 条消息`),
+      parts ? parts.projectChip : null,
       web ? pluginPill() : null,
-      conv.workspace ? workspaceTip(conv.workspace) : null));
+      conv.workspace ? workspaceTip(conv.workspace) : null),
+    parts ? parts.summaryCard : null,
+    parts ? parts.denoiseBar : null);
   let firstHit = null;
   const qs = [];
   const msgNode = (m) => {
@@ -505,21 +546,8 @@ async function openConversation(id, terms) {
     outlineEl = qs.length >= 2 ? buildOutline(scroller, qs) : null;
     if (outlineEl) pane.append(outlineEl);
   };
-  const copyBtn = h('button', { type: 'button' }, icon('copy'), h('span', {}, '复制全文'));
-  let copying = false;
-  copyBtn.addEventListener('click', async () => {
-    if (copying) return;
-    copying = true;
-    try {
-      // 点击时才分页取全文拼接，不在打开详情时预先拼好
-      await mem0.copy(await readFullText(id));
-      copyBtn.classList.add('done'); copyBtn.lastChild.textContent = '已复制';
-      setTimeout(() => { copyBtn.classList.remove('done'); copyBtn.lastChild.textContent = '复制全文'; }, 1500);
-    } finally { copying = false; }
-  });
-  track.append(h('div', { class: 'float' }, copyBtn));
   scroller.append(track);
-  pane.replaceChildren(scroller);
+  fill(pane, scroller);
   refreshOutline();
   // 长会话首屏只有最近一页：停在最新处，往上滚才够得着更早的消息；短会话仍从顶部开始
   let firstSeq = conv.messages.length ? conv.messages[0].seq : 0;
@@ -613,7 +641,7 @@ function renderLocalSources() {
     else rows.push(foldBtn(false, missing.length));
   }
   if (!rows.length) rows.push(h('div', { class: 'grow' }, h('div', { class: 'ds' }, '没有可用的本机来源')));
-  $('#local-sources').replaceChildren(...rows);
+  fill($('#local-sources'), ...rows);
 }
 
 /** 帮助浮层定位：返回视口坐标，水平与垂直都夹在窗口内，下方放不下时翻到上方 */
@@ -664,7 +692,7 @@ function renderConnect() {
   $('#btn-pair').textContent = b.paired ? '配对新浏览器' : '配对';
   $('#btn-pair').classList.toggle('pri', !b.paired);
   $('#btn-pair').disabled = !s.services.bridge.ok;
-  $('#web-sources').replaceChildren(...s.webSources.map((w) => {
+  fill($('#web-sources'), ...s.webSources.map((w) => {
     const n = st.bySource[w.id] || 0; const t = tb[w.id];
     const desc = !w.enabled ? '已暂停备份' : t && t.conversations ? `今天存了 ${t.conversations} 个会话 · 共 ${nf.format(n)} 个` : n ? `共 ${nf.format(n)} 个会话` : '还没有备份的会话';
     return h('div', { class: `grow indent ${w.enabled ? '' : 'off'}`, 'data-source': w.id },
@@ -683,7 +711,7 @@ function renderConnect() {
   const mb = $('#mcp-badge');
   mb.className = `badge ${s.services.mcp.ok ? 'ok' : s.services.mcp.starting ? '' : 'bad'}`;
   mb.textContent = s.services.mcp.ok ? '运行中' : s.services.mcp.starting ? '启动中' : '未启动';
-  $('#clients').replaceChildren(...(s.clients.length ? s.clients.map((c) => {
+  fill($('#clients'), ...(s.clients.length ? s.clients.map((c) => {
     const [txt, cls] = CLIENT_STATUS[c.status] || [c.status, ''];
     const connected = c.status === 'connected';
     return h('div', { class: 'grow' },
@@ -705,7 +733,7 @@ $('#btn-pair').addEventListener('click', async () => {
   clearInterval(pairTimer);
   const tick = () => {
     const left = Math.max(0, Math.round((p.expiresAt - Date.now()) / 1000));
-    box.replaceChildren(h('div', { class: 'sub' }, '在 mem0 浏览器插件中输入配对码'), h('div', { class: 'code' }, p.code), h('div', { class: 'sub' }, left ? `${left} 秒后失效` : '已失效，请重新生成'));
+    fill(box, h('div', { class: 'sub' }, '在 mem0 浏览器插件中输入配对码'), h('div', { class: 'code' }, p.code), h('div', { class: 'sub' }, left ? `${left} 秒后失效` : '已失效，请重新生成'));
     if (!left) clearInterval(pairTimer);
   };
   tick();
@@ -769,6 +797,7 @@ function renderSync() {
 }
 function renderAll() {
   renderSync(); renderFilter(); renderHome(); renderConnect(); renderSettings(); renderTheme();
+  if (ext()) ext().renderAll();
 }
 
 mem0.onChanged((s) => {

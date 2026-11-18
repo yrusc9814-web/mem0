@@ -1,10 +1,12 @@
 'use strict';
 const path = require('node:path');
+const fs = require('node:fs/promises');
 const electron = require('electron');
 const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, nativeTheme, shell, clipboard, dialog } = electron;
 const { dataDir, dataDirSource, setPointerFile, getPointerFile, sourceRoots } = require('./paths');
 const datamove = require('./datamove');
-const { Store, LOCAL_SOURCES, WEB_SOURCES } = require('./db');
+const { Store, LOCAL_SOURCES, WEB_SOURCES, MEMORY_GROUPS } = require('./db');
+const { AiOrganizer, splitPastedTextToDrafts } = require('./ai-organizer');
 const { LocalIngestor } = require('./ingest');
 // ./mcp（MCP SDK + zod，冷启动约 400ms）和 ./bridge（ws）在窗口出来后才 require，见 startServices()
 const { TrayPopover } = require('./tray-window');
@@ -24,7 +26,7 @@ if (!app.requestSingleInstanceLock()) { app.quit(); process.exit(0); }
 let win = null;
 let tray = null;
 let popover = null;
-let store, ingestor, mcp, bridge, trayStats;
+let store, ingestor, mcp, bridge, trayStats, aiOrganizer;
 let quitting = false;
 let quitCleanupStarted = false; // 退出清理只跑一次（防重入）
 let quitConfirmed = false; // macOS 用户已确认退出
@@ -48,6 +50,7 @@ const runQuitCleanup = () => cleanupForQuit({
   tasks: [
     // 数据库最后关：等扫描、MCP、桥接都收尾后再关，避免在途扫描写到已关闭的库
     async () => {
+      aiOrganizer?.stop();
       await Promise.allSettled([ingestor?.stopAndWait(), mcp?.close(), bridge?.close()]);
       if (store && !storeClosed) { storeClosed = true; store.close(); }
     },
@@ -107,6 +110,7 @@ const mainWc = () => (win && !win.isDestroyed() ? win.webContents : null);
 /** 原生对话框：主窗口还在就用它做父窗口，已销毁时退回无父窗口调用 */
 const showBox = (opts) => (win && !win.isDestroyed() ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts));
 const showOpen = (opts) => (win && !win.isDestroyed() ? dialog.showOpenDialog(win, opts) : dialog.showOpenDialog(opts));
+const showSave = (opts) => (win && !win.isDestroyed() ? dialog.showSaveDialog(win, opts) : dialog.showSaveDialog(opts));
 
 /** 规整 renderer 上报的页面/会话，脏数据一律丢弃 */
 function sanitizeNav(nav) {
@@ -170,6 +174,37 @@ const mcpCallsToday = () => (trayStats ? trayStats.mcpCallsToday() : 0);
 const push = (channel, payload) => { const wc = mainWc(); if (wc) wc.send(channel, payload); };
 const pushAll = (channel, payload) => { push(channel, payload); if (popover) popover.send(channel, payload); };
 
+/** 4 个固定常驻分组的展示元数据（顺序以 db.MEMORY_GROUPS 为准，空库也返回） */
+const MEMORY_GROUP_META = {
+  '个人与职业背景': { icon: 'user', copyLabel: '复制本页' },
+  '协作与沟通准则': { icon: 'shield', copyLabel: '复制准则 MD' },
+  '环境与工作流': { icon: 'monitor', copyLabel: '复制本页' },
+  '踩坑与经验库': { icon: 'bulb', copyLabel: '复制本页', presetTags: ['Windows', '网络', 'SQLite', '采集与前端'] },
+};
+const memoryGroupMeta = () => MEMORY_GROUPS.map((id) => ({ id, ...(MEMORY_GROUP_META[id] || { icon: 'bulb', copyLabel: '复制本页' }) }));
+
+/** AI 尚未初始化时的公开状态兜底（同样不含 apiKey） */
+const EMPTY_AI_STATE = {
+  enabled: false, provider: 'deepseek', baseUrl: '', model: '',
+  hasKey: false, keyHint: '', statusText: '未配置', statusOk: false,
+  unorganizedCount: 0, organizing: false,
+};
+
+/**
+ * 创建后台 AI 整理器：注入 electron（safeStorage 加密密钥、net.fetch 复用系统代理）。
+ * 包一层 organizeConversation：每条整理完成后向渲染层推送最新 fullState，前端实时刷新。
+ */
+function createAiOrganizer() {
+  const organizer = new AiOrganizer({ store, electron });
+  const organize = organizer.organizeConversation.bind(organizer);
+  organizer.organizeConversation = async (id) => {
+    const result = await organize(id);
+    if (result) push('changed', fullState());
+    return result;
+  };
+  return organizer;
+}
+
 function fullState() {
   const mcpUrl = services.mcp.url;
   return {
@@ -177,6 +212,10 @@ function fullState() {
     dataDir: dataDir(),
     dataDirSource: dataDirSource(),
     stats: store.stats(),
+    projects: store.listProjects({ includeArchived: true }),
+    memories: store.listMemories(),
+    memoryGroups: memoryGroupMeta(),
+    ai: aiOrganizer ? aiOrganizer.getPublicState() : { ...EMPTY_AI_STATE },
     localSources: ingestor.getStatus(),
     webSources: WEB_SOURCES.map((p) => ({ id: `${p}-web`, platform: p, enabled: store.isSourceEnabled(`${p}-web`) })),
     services,
@@ -213,6 +252,160 @@ function registerIpc() {
       return store.getConversation(id, { fromSeq, limit });
     }
     return store.getConversation(id, { limit: 2000 });
+  }));
+  // ---------- v4：记录页会话元数据 / 记忆页卡片与推进事项 / 设置页 AI ----------
+  ipcMain.handle('updateConvMeta', guard((id, patch) => {
+    const conversation = store.updateConversationMeta(id, patch || {});
+    // 同时保留顶层会话字段（title / project_id 等）与 conversation 包装，兼容前端两种取法
+    return { ...(conversation || {}), conversation, state: fullState() };
+  }));
+  ipcMain.handle('saveProject', guard((proj) => {
+    const input = proj && typeof proj === 'object' ? proj : {};
+    const { settleCards, ...fields } = input;
+    const project = store.saveProject(fields);
+    // 结项归档时可选把拍板结论转存为常驻卡片（仅接受 4 个合法分组）
+    if (Array.isArray(settleCards)) {
+      for (const card of settleCards) {
+        if (!card || typeof card !== 'object') continue;
+        const group = MEMORY_GROUPS.includes(card.group) ? card.group
+          : MEMORY_GROUPS.includes(card.target) ? card.target : null;
+        const title = String(card.title == null ? '' : card.title).trim();
+        if (!group || !title) continue;
+        store.saveMemory({
+          group,
+          title,
+          body: card.body,
+          tags: card.tags,
+          sourceIds: card.sourceIds,
+          originLabel: card.originLabel || '手动录入',
+        });
+      }
+    }
+    return { project, state: fullState() };
+  }));
+  ipcMain.handle('deleteProject', guard((id) => {
+    const project = store.deleteProject(id);
+    return { ...(project || {}), project, state: fullState() };
+  }));
+  ipcMain.handle('saveMemory', guard((card) => {
+    const memory = store.saveMemory(card || {});
+    return { ...(memory || {}), memory, state: fullState() };
+  }));
+  ipcMain.handle('moveMemory', guard((id, patch) => {
+    const memory = store.moveMemory(id, patch || {});
+    return { ...(memory || {}), memory, state: fullState() };
+  }));
+  ipcMain.handle('deleteMemory', guard((id) => {
+    const memory = store.deleteMemory(id);
+    return { ...(memory || {}), memory, state: fullState() };
+  }));
+  // 粘贴导入确认：target 为 4 个常驻分组之一，或 '__new_project__' 新建推进事项
+  ipcMain.handle('batchImportMemories', guard((items) => {
+    const list = Array.isArray(items) ? items : (items && Array.isArray(items.items) ? items.items : []);
+    const memories = [];
+    const projects = [];
+    for (const raw of list) {
+      if (!raw || typeof raw !== 'object') continue;
+      const target = String(raw.target || raw.group || '').trim();
+      const title = String(raw.title == null ? '' : raw.title).trim();
+      const body = String(raw.body == null ? '' : raw.body);
+      if (target === '__new_project__' || raw.kind === 'project') {
+        const name = title || body.split('\n')[0].trim().slice(0, 120);
+        if (!name) continue;
+        const project = store.saveProject({
+          name,
+          state: raw.state || '推进中',
+          workspace: raw.workspace,
+          progress: raw.progress || body,
+          decisions: raw.decisions,
+          rejected: raw.rejected,
+          nextStep: raw.nextStep,
+        });
+        if (project) projects.push(project);
+        continue;
+      }
+      if (!title) continue;
+      const group = MEMORY_GROUPS.includes(target) ? target : MEMORY_GROUPS[0];
+      const memory = store.saveMemory({
+        group,
+        title,
+        body,
+        tags: raw.tags,
+        sourceIds: raw.sourceIds,
+        originLabel: raw.originLabel || '手动录入',
+      });
+      if (memory) memories.push(memory);
+    }
+    return {
+      memories,
+      projects,
+      importedMemories: memories.length,
+      importedProjects: projects.length,
+      state: fullState(),
+    };
+  }));
+  ipcMain.handle('splitImportText', guard(async (raw, fallbackGroup) => {
+    const fallback = MEMORY_GROUPS.includes(fallbackGroup) ? fallbackGroup : MEMORY_GROUPS[0];
+    if (aiOrganizer) return aiOrganizer.splitImportWithAI(raw, fallback);
+    return splitPastedTextToDrafts(raw, fallback);
+  }));
+  ipcMain.handle('saveAiConfig', guard((cfg) => {
+    aiOrganizer.saveConfig(cfg || {});
+    const state = fullState();
+    push('changed', state);
+    return state;
+  }));
+  ipcMain.handle('testAiConfig', guard(async (cfg) => {
+    const result = await aiOrganizer.testConfig(cfg || {});
+    const state = fullState();
+    push('changed', state);
+    return { ...result, state };
+  }));
+  ipcMain.handle('organizeOld', guard(async (opts) => {
+    const result = await aiOrganizer.organizeOldConversations(opts || {});
+    const state = fullState();
+    push('changed', state);
+    return { ...result, state };
+  }));
+  ipcMain.handle('exportMemoryPack', guard(async () => {
+    const pack = store.exportMemoryPack();
+    const stamp = new Date().toISOString().slice(0, 10);
+    const picked = await showSave({
+      title: '导出记忆包',
+      defaultPath: path.join(dataDir(), `mem0-memory-pack-${stamp}.json`),
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    if (!picked || picked.canceled || !picked.filePath) return { ok: false, canceled: true };
+    await fs.writeFile(picked.filePath, JSON.stringify(pack, null, 2), 'utf8');
+    return {
+      ok: true,
+      filePath: picked.filePath,
+      counts: { memories: pack.memories.length, projects: pack.projects.length },
+    };
+  }));
+  ipcMain.handle('importMemoryPack', guard(async () => {
+    const picked = await showOpen({
+      title: '导入记忆包',
+      properties: ['openFile'],
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    if (!picked || picked.canceled || !picked.filePaths || !picked.filePaths[0]) {
+      return { ok: false, canceled: true, state: fullState() };
+    }
+    let pack;
+    try {
+      pack = JSON.parse(await fs.readFile(picked.filePaths[0], 'utf8'));
+    } catch (e) {
+      return { ok: false, error: `无法读取记忆包：${String(e.message || e)}`, state: fullState() };
+    }
+    try {
+      const result = store.importMemoryPack(pack);
+      const state = fullState();
+      push('changed', state);
+      return { ok: true, ...result, state };
+    } catch (e) {
+      return { ok: false, error: String(e.message || e), state: fullState() };
+    }
   }));
   ipcMain.handle('delete', guard(async (id) => {
     const { response } = await showBox({ type: 'warning', buttons: ['删除', '取消'], defaultId: 1, cancelId: 1, message: '从 mem0 删除这个会话？', detail: '只删除本地备份，不影响原平台。若原会话之后有新消息，会被重新备份。' });
@@ -305,9 +498,10 @@ async function changeDataDir() {
 
   movingData = true;
   ingestor && ingestor.stop();
+  aiOrganizer?.stop();
   try { await mcp?.close(); } catch { /* ignore */ }
   try { await bridge?.close(); } catch { /* ignore */ }
-  mcp = null; bridge = null;
+  mcp = null; bridge = null; aiOrganizer = null;
   if (store && !storeClosed) { storeClosed = true; try { store.close(); } catch { /* ignore */ } }
   let detail;
   try {
@@ -345,6 +539,8 @@ async function startServices(saved, changed) {
       const today = p && Number.isFinite(Number(p.today)) ? Number(p.today) : mcpCallsToday();
       pushAll('mcp-calls', { today });
     });
+    // save_memory 写入卡片/事项后实时通知前端刷新记忆页与首页
+    ev.on('mutated', () => push('changed', fullState()));
   }
   const startMcp = mcpModule.startMcpServer(store, { version: VERSION }).then((m) => {
     mcp = m;
@@ -370,6 +566,7 @@ async function boot() {
   try { setPointerFile(path.join(app.getPath('userData'), 'data-location.json')); } catch (e) { console.error('[boot] userData', e.message); }
   store = Store.open(dataDir());
   bootLog('store opened');
+  aiOrganizer = createAiOrganizer();
   ingestor = new LocalIngestor(store, sourceRoots());
   trayStats = new TrayStats(store);
   let refresh = null;
@@ -389,6 +586,9 @@ async function boot() {
   bootLog('window created');
   createTray();
   bootLog('tray created');
+  // app ready 后启动后台静默整理定时器（未启用 / 无 Key 时每轮空转，不发请求）
+  aiOrganizer.start();
+  bootLog('ai organizer started');
 
   // 主窗口页面加载完（首个 state 已可取）后再起服务和首轮扫描，不和窗口抢主线程
   let afterLoadDone = false;

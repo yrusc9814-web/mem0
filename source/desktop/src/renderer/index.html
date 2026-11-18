@@ -6,6 +6,7 @@
   <title>mem0</title>
   <link rel="stylesheet" href="fonts/fonts.css" />
   <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="memory-clean.css" />
   <script src="theme.js"></script>
 </head>
 <body>
@@ -13,6 +14,7 @@
     <div class="logo" title="mem0" data-brand></div>
     <button class="nav" data-view="home" data-icon="home"><span>首页</span></button>
     <button class="nav" data-view="records" data-icon="chat"><span>记录</span></button>
+    <button class="nav" data-view="memory" data-icon="memory"><span>记忆</span></button>
     <button class="nav" data-view="connect" data-icon="link"><span>连接</span></button>
     <div class="top-right">
       <span id="sync-status" class="sync"><i class="dot"></i><span id="sync-text">–</span></span>
@@ -26,7 +28,7 @@
     <!-- 首页 -->
     <section class="view" id="view-home">
       <div class="col">
-        <label class="search"><i data-icon="search"></i><input id="home-q" type="search" placeholder="搜索所有 AI 对话…" autocomplete="off" /></label>
+        <label class="search"><i data-icon="search"></i><input id="home-q" type="search" placeholder="搜索所有 AI 对话与记忆…" autocomplete="off" /></label>
         <h3>今日动态</h3>
         <div class="grid2">
           <div class="card clickable" id="card-backup">
@@ -35,11 +37,13 @@
             <div class="sub" id="backup-sub"></div>
           </div>
           <div class="card clickable" id="card-mcp">
-            <div class="hd"><i data-icon="swap"></i>让 AI 读取历史<span class="hd-note" id="mcp-today">今天互通 <b id="mcp-today-n">0</b> 次</span><i class="chev" data-icon="chevron"></i></div>
+            <div class="hd"><i data-icon="swap"></i>让 AI 读写记忆<span class="hd-note" id="mcp-today">今天互通 <b id="mcp-today-n">0</b> 次</span><i class="chev" data-icon="chevron"></i></div>
             <div class="mcp-flow" id="mcp-flow"></div>
             <div class="sub" id="mcp-sub"></div>
           </div>
         </div>
+        <h3 class="row-between hidden" id="home-projects-hd">正在推进<button class="text-btn" id="btn-all-projects" type="button">查看全部事项 ›</button></h3>
+        <div class="work-list" id="home-projects"></div>
         <div class="card storage">
           <div class="hd"><i data-icon="layers"></i>总存储<span class="hd-right"><b id="total-msgs">0</b> <span class="sub" id="total-convs">条消息</span></span></div>
           <div class="bar" id="storage-bar"></div>
@@ -53,8 +57,12 @@
     <!-- 记录 -->
     <section class="view" id="view-records">
       <aside class="side">
-        <label class="search small"><i data-icon="search"></i><input id="q" type="search" placeholder="搜索" autocomplete="off" /></label>
-        <div class="filter-row">
+        <label class="search small"><i data-icon="search"></i><input id="q" type="search" placeholder="搜索标题、备注或正文…" autocomplete="off" /></label>
+        <div class="filter-row rec-mode-bar">
+          <div class="mode-seg" id="rec-mode-seg" role="tablist" aria-label="会话排列方式">
+            <button class="on" data-rmode="time" type="button">按时间</button>
+            <button data-rmode="project" type="button">按事项</button>
+          </div>
           <div class="srcfilter" id="srcfilter">
             <button class="chipsel" id="filter-btn" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="filter-menu"><span id="filter-label">全部来源</span><i data-icon="down"></i></button>
             <div class="pop menu hidden" id="filter-menu" role="listbox" aria-multiselectable="true" aria-label="按来源筛选"></div>
@@ -67,17 +75,28 @@
       </div>
     </section>
 
+    <!-- 记忆 -->
+    <section class="view" id="view-memory">
+      <aside class="mem-side" aria-label="记忆目录">
+        <label class="search small"><i data-icon="search"></i><input id="mem-q" type="search" placeholder="搜索记忆内容或事项…" autocomplete="off" /></label>
+        <div class="mem-nav-scroll" id="mem-nav"></div>
+      </aside>
+      <div class="mem-detail" id="mem-detail">
+        <div class="scroller" id="mem-scroller"><div class="track mem-track" id="mem-track"></div></div>
+      </div>
+    </section>
+
     <!-- 连接 -->
     <section class="view" id="view-connect">
       <div class="col">
         <div class="tabs">
           <button class="tab on" data-tab="sources">备份来源</button>
-          <button class="tab" data-tab="mcp">让 AI 读取（MCP）</button>
+          <button class="tab" data-tab="mcp">让 AI 读写（MCP）</button>
         </div>
 
         <div class="tabpane on" id="tab-sources">
           <h3 class="row-between">本机 AI 对话<span class="h3-count" id="local-count"></span></h3>
-          <p class="hint">自动读取本机会话文件，实时备份。只读，不修改原文件。</p>
+          <p class="hint">自动读取本机会话文件、原生标题与工作区目录，剥离工具刷屏噪音，保留全部问答正文。只读，不修改原文件。</p>
           <div class="group" id="local-sources"></div>
           <h3>网页 AI 对话</h3>
           <div class="group">
@@ -101,6 +120,14 @@
               <div class="grow-main"><div class="nm">服务地址</div><div class="ds mono" id="mcp-url">–</div></div>
               <div class="end"><button class="btn" id="btn-copy-mcp-url">复制</button><span class="badge" id="mcp-badge">–</span></div>
             </div>
+          </div>
+          <h3>按需读写机制（0 启动上下文占用）</h3>
+          <p class="hint">连接后不会在启动时塞入任何提示词，由你正在用的 Agent 按需读取、顺手写回：</p>
+          <div class="group">
+            <div class="grow"><div class="grow-main"><div class="nm"><span class="mcp-tool-name">get_memory_context</span>按模块读画像与事项简报</div><div class="ds">按需拉取个人背景、协作准则、环境配置，或单个推进事项的进展与已否决方案</div></div></div>
+            <div class="grow"><div class="grow-main"><div class="nm"><span class="mcp-tool-name">list_conversations</span>按日期或事项查目录</div><div class="ds">按时间区间或按事项列出跨端会话标题与备注，不含大段正文</div></div></div>
+            <div class="grow"><div class="grow-main"><div class="nm"><span class="mcp-tool-name">recall</span>搜经验库与历史对话切片</div><div class="ds">跨全部来源检索排障经验、记忆卡与真实对话原话片段，自动跳过已读内容</div></div></div>
+            <div class="grow"><div class="grow-main"><div class="nm"><span class="mcp-tool-name">save_memory</span>让当前 Agent 顺手写回结论</div><div class="ds">你吩咐“把刚才的结论记进 mem0”时，由当前 Agent 总结写入本机</div></div></div>
           </div>
           <div class="mcp-help-head" id="mcp-help-head">
             <h3>一键连接<span class="mcp-help" id="mcp-help-wrap">
@@ -134,6 +161,8 @@
     <section class="view" id="view-settings">
       <div class="col">
         <h2 class="serif">设置</h2>
+        <h3>AI 自动整理</h3>
+        <div class="group" id="settings-ai"></div>
         <h3>外观</h3>
         <div class="group">
           <div class="grow">
@@ -143,11 +172,15 @@
             </div>
           </div>
         </div>
-        <h3>数据</h3>
+        <h3>数据与跨设备迁移</h3>
         <div class="group">
           <div class="grow">
             <div class="grow-main"><div class="nm">数据目录</div><div class="ds mono" id="datadir">–</div></div>
             <div class="end"><button class="btn" id="btn-datadir-change">更改</button><button class="btn" id="btn-datadir">打开</button></div>
+          </div>
+          <div class="grow">
+            <div class="grow-main"><div class="nm">导出 / 导入记忆包</div><div class="ds">把记忆卡与推进事项打包成本地 JSON，方便 Windows 与 Mac 之间迁移备份</div></div>
+            <div class="end"><button class="btn" id="btn-import-mem" type="button">导入</button><button class="btn" id="btn-export-mem" type="button">导出记忆包</button></div>
           </div>
           <div class="grow">
             <div class="grow-main"><div class="nm">重新扫描本机来源</div><div class="ds">平时会自动实时备份，一般不需要手动扫描</div></div>
@@ -169,5 +202,6 @@
   <script src="icons.js"></script>
   <script src="common.js"></script>
   <script src="app.js"></script>
+  <script src="memory.js"></script>
 </body>
 </html>

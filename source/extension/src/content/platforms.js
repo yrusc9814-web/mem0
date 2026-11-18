@@ -208,6 +208,9 @@
     },
   };
 
+  // Gemini：展开的「思考过程」块只用于展示，不属于正式回答
+  const GEMINI_THOUGHTS = 'model-thoughts, [class*="model-thoughts"], .thoughts-container, [data-test-id*="thought"]';
+
   const platforms = [
     {
       id: 'chatgpt',
@@ -290,6 +293,15 @@
         firstAll(doc, ['user-query .query-text', 'user-query']),
         firstAll(doc, ['model-response message-content', 'model-response .model-response-text', 'model-response']),
       ),
+      text: (el, role) => {
+        // 助手回答先剔除展开的思考节点，再读正文；用户消息保持原样
+        if (role !== 'assistant') return NS.readText(el);
+        const thoughts = el.querySelectorAll(GEMINI_THOUGHTS);
+        if (!thoughts.length) return NS.readText(el);
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll(GEMINI_THOUGHTS).forEach((n) => n.remove());
+        return NS.readText(clone);
+      },
       title: (doc) => {
         const t = first(doc, ['.conversation.selected .conversation-title', '[data-test-id="conversation-title"]']);
         return (t && t.textContent.trim()) || null;

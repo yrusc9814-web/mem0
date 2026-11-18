@@ -16,6 +16,23 @@ contextBridge.exposeInMainWorld('mem0', {
   /** 详情分页：{ tail } 取最近 N 条，或 { fromSeq, limit } 取指定区间（复制全文时分页取完） */
   read: (id, opts) => ipcRenderer.invoke('read', id, opts),
   remove: call('delete'),
+  /** 记录页：手动编辑会话元数据（标题 / 归属事项 / 摘要 / 拍板结论 / 下一步） */
+  updateConvMeta: call('updateConvMeta'),
+  /** 记忆页：推进事项与常驻卡片读写（SPEC 4.4） */
+  saveProject: call('saveProject'),
+  deleteProject: call('deleteProject'),
+  saveMemory: call('saveMemory'),
+  moveMemory: call('moveMemory'),
+  deleteMemory: call('deleteMemory'),
+  batchImportMemories: call('batchImportMemories'),
+  splitImportText: call('splitImportText'),
+  /** 设置页：后台轻量 AI 自动整理配置与旧对话批处理 */
+  saveAiConfig: call('saveAiConfig'),
+  testAiConfig: call('testAiConfig'),
+  organizeOld: call('organizeOld'),
+  /** 跨设备记忆包导出 / 导入（mem0-memory-pack-v1） */
+  exportMemoryPack: call('exportMemoryPack'),
+  importMemoryPack: call('importMemoryPack'),
   setSource: call('setSource'),
   rescan: call('rescan'),
   connectClient: call('connectClient'),

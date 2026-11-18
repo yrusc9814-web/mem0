@@ -32,7 +32,9 @@ const CONTINUED_PREFIX = 'This session is being continued from a previous conver
 // 用户中断提示（含 for tool use 变体）
 const INTERRUPTED_PREFIX = '[Request interrupted by user';
 
-function textOf(content) {
+const STRIPPED_BLOCKS = new Set(['tool_use', 'tool_result', 'thinking', 'redacted_thinking']);
+
+function textOf(content, stats) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   const parts = [];
@@ -42,6 +44,7 @@ function textOf(content) {
     // 只取正文；tool_use / tool_result / thinking / redacted_thinking 一律丢弃
     if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text);
     else if (b.type === 'image') hasImage = true;
+    else if (STRIPPED_BLOCKS.has(b.type) && stats) stats.stripped++;
   }
   const text = parts.join('\n').trim();
   // 没有文字时才用 [图片] 占位，避免纯图片消息被整条丢掉
@@ -49,8 +52,11 @@ function textOf(content) {
 }
 
 // 删掉正文里夹带的 <system-reminder>…</system-reminder>（可多段、可跨行）
-function stripReminders(text) {
-  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
+function stripReminders(text, stats) {
+  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, () => {
+    if (stats) stats.stripped++;
+    return '';
+  });
 }
 
 function isInjectedUserText(text) {
@@ -59,6 +65,7 @@ function isInjectedUserText(text) {
 
 async function read(file) {
   const messages = [];
+  const stats = { stripped: 0 };
   let sessionId = path.basename(file, '.jsonl');
   let cwd = null;
   let summary = null;
@@ -73,18 +80,19 @@ async function read(file) {
     if (ev.type === 'custom-title' && typeof ev.customTitle === 'string') { customTitle = ev.customTitle; continue; }
     if (ev.type === 'ai-title' && typeof ev.aiTitle === 'string') { aiTitle = ev.aiTitle; continue; }
     if (ev.type !== 'user' && ev.type !== 'assistant') continue;
-    if (ev.isSidechain || ev.isMeta) continue;
+    if (ev.isSidechain || ev.isMeta) { stats.stripped++; continue; }
     // 压缩上下文生成的摘要事件，不是真实对话
-    if (ev.isCompactSummary === true) continue;
+    if (ev.isCompactSummary === true) { stats.stripped++; continue; }
     const msg = ev.message;
     if (!msg) continue;
     const role = msg.role === 'assistant' ? 'assistant' : 'user';
-    let text = textOf(msg.content);
+    let text = textOf(msg.content, stats);
     if (!text) continue;
     if (role === 'user') {
-      text = stripReminders(text).trim();
+      text = stripReminders(text, stats).trim();
       // 只剩工具结果/命令包装/中断提示/续接摘要时整条丢弃
-      if (!text || isInjectedUserText(text)) continue;
+      if (!text) continue;
+      if (isInjectedUserText(text)) { stats.stripped++; continue; }
     }
     if (ev.sessionId) sessionId = ev.sessionId;
     if (ev.cwd) cwd = ev.cwd;
@@ -105,6 +113,7 @@ async function read(file) {
     title: customTitle || aiTitle || summary || undefined,
     workspace: cwd,
     messages,
+    strippedBlocks: stats.stripped,
     ingestMethod: 'local',
   };
 }

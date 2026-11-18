@@ -1,5 +1,5 @@
 // 插件自测：各平台 DOM 解析 + 与桌面端插件桥的端到端联调。
-// 桌面端联调需要 ../mem0-desktop 已 npm install；找不到就跳过。
+// 桌面端联调目录按 MEM0_DESKTOP_DIR → ../mem0-desktop → ../desktop 解析，需已 npm install。
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -15,6 +15,19 @@ import './bridge-flush.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
+// 桌面端目录解析：MEM0_DESKTOP_DIR → ../mem0-desktop → ../desktop，取第一个 package.json.name === 'mem0-desktop' 的目录。
+function resolveDesktopDir(base) {
+  const candidates = [];
+  if (process.env.MEM0_DESKTOP_DIR) candidates.push(path.resolve(process.env.MEM0_DESKTOP_DIR));
+  candidates.push(path.resolve(base, '..', 'mem0-desktop'), path.resolve(base, '..', 'desktop'));
+  for (const dir of candidates) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+      if (pkg && pkg.name === 'mem0-desktop') return dir;
+    } catch { /* 继续尝试下一个候选目录 */ }
+  }
+  return null;
+}
 const code = ['src/content/platforms.js', 'src/content/engine.js'].map((f) => fs.readFileSync(path.join(root, f), 'utf8'));
 
 function load(url, html) {
@@ -49,6 +62,15 @@ const cases = [
       <user-query><div class="query-text">明天呢</div></user-query>
       <model-response><message-content><p>多云。</p></message-content></model-response>`,
     expect: { n: 4, roles: 'user,assistant,user,assistant' },
+  },
+  {
+    name: 'Gemini 思考节点', url: 'https://gemini.google.com/app/a1b2c3d4e5f6',
+    body: `<user-query><div class="query-text">东京今天天气</div></user-query>
+      <model-response><message-content><model-thoughts><div>思考：先确认城市，再查预报。这段不能进正文。</div></model-thoughts>
+      <div class="thoughts-container">补充推理：不要采集这里。</div>
+      <p data-test-id="thought-note">内部备注也不要。</p>
+      <p>晴，18 度。</p><p>明天多云。</p></message-content></model-response>`,
+    expect: { n: 2, roles: 'user,assistant', has: ['晴，18 度。\n明天多云。'], not: ['先确认城市', '补充推理', '内部备注'] },
   },
   {
     name: 'DeepSeek', url: 'https://chat.deepseek.com/a/chat/s/8d1c6f0e-aaaa-bbbb-cccc-111122223333',
@@ -124,6 +146,26 @@ for (const c of cases) {
   pass++;
 }
 console.log(`✓ 平台解析 ${pass}/${cases.length}`);
+
+// Gemini：展开的思考块不进入正文；没有思考节点时结果与原来完全一致
+{
+  const url = 'https://gemini.google.com/app/a1b2c3d4e5f6';
+  const plain = load(url, {
+    body: `<user-query><div class="query-text">东京今天天气</div></user-query>
+      <model-response><message-content><p>晴，18 度。</p><p>明天多云。</p></message-content></model-response>`,
+  });
+  const expected = ['东京今天天气', '晴，18 度。\n明天多云。'];
+  assert.deepEqual(Array.from(plain.messages, (m) => m.content), expected, 'Gemini 无思考节点');
+  const withThoughts = load(url, {
+    body: `<user-query><div class="query-text">东京今天天气</div></user-query>
+      <model-response><message-content><model-thoughts><div>思考：先确认城市，再查预报。这段不能进正文。</div></model-thoughts>
+      <div class="thoughts-container">补充推理：不要采集这里。</div>
+      <p data-test-id="thought-note">内部备注也不要。</p>
+      <p>晴，18 度。</p><p>明天多云。</p></message-content></model-response>`,
+  });
+  assert.deepEqual(Array.from(withThoughts.messages, (m) => m.content), expected, 'Gemini 思考节点应被剔除');
+  console.log('✓ Gemini 思考节点剔除');
+}
 
 // ---------- 内容脚本运行时（jsdom + chrome 桩） ----------
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -224,11 +266,22 @@ function contentRun(url, html) {
 }
 
 // ---------- 与桌面端联调 ----------
-const desktop = path.resolve(root, '..', 'mem0-desktop');
-if (!fs.existsSync(path.join(desktop, 'node_modules'))) {
-  console.log('- 跳过桌面端联调（未找到 ../mem0-desktop/node_modules）');
+if (process.env.MEM0_SKIP_DESKTOP === '1') {
+  console.log('已按 MEM0_SKIP_DESKTOP=1 跳过桌面端联调');
   process.exit(0);
 }
+const desktop = resolveDesktopDir(root);
+if (!desktop) {
+  console.error('错误：未找到 mem0 桌面端目录（已尝试 MEM0_DESKTOP_DIR、../mem0-desktop、../desktop）。');
+  console.error('请设置 MEM0_DESKTOP_DIR 指向桌面端源码目录；如确需跳过，请显式设置 MEM0_SKIP_DESKTOP=1。');
+  process.exit(1);
+}
+if (!fs.existsSync(path.join(desktop, 'node_modules'))) {
+  console.error(`错误：桌面端目录 ${desktop} 缺少 node_modules，请先在桌面端执行 npm install。`);
+  console.error('如确需跳过，请显式设置 MEM0_SKIP_DESKTOP=1。');
+  process.exit(1);
+}
+console.log(`✓ 桌面端目录：${desktop}`);
 const require = createRequire(path.join(desktop, 'package.json'));
 const { Store } = require('./src/main/db.js');
 const { startBridge } = require('./src/main/bridge.js');

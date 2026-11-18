@@ -10,6 +10,8 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
+const url = require('node:url');
+const { DatabaseSync } = require('node:sqlite');
 const { readLines } = require('./read-lines');
 
 const ID = 'antigravity';
@@ -56,9 +58,77 @@ async function titleFromBrain(dir) {
   return undefined;
 }
 
+// conversation_summaries.db 查询结果按 dbPath + mtimeMs 轻量缓存，读取完立即 close
+const summaryCache = new Map();
+
+/** workspace_uris 是 JSON 数组字符串；Windows 盘符 URI 要显式按 windows 规则解码 */
+function workspaceFromUris(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return undefined;
+  let list;
+  try { list = JSON.parse(raw); } catch { return undefined; }
+  if (!Array.isArray(list)) return undefined;
+  const u = list.find((x) => typeof x === 'string' && x.trim());
+  if (!u) return undefined;
+  if (!u.startsWith('file://')) return u;
+  try {
+    const isWinUri = /^file:\/\/\/[a-zA-Z](?:%3A|:)(?:\/|$)/i.test(u);
+    return url.fileURLToPath(u, { windows: isWinUri });
+  } catch {
+    return undefined;
+  }
+}
+
+function readSummaries(dbPath) {
+  try {
+    const st = fs.statSync(dbPath);
+    const cached = summaryCache.get(dbPath);
+    if (cached && cached.mtimeMs === st.mtimeMs) return cached.rows;
+    const db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+    let rows;
+    try {
+      // 严禁 SELECT *：真实表里有纳秒级 64 位时间戳，node:sqlite 读成 Number 会抛 ERR_OUT_OF_RANGE
+      rows = new Map();
+      const list = db.prepare(`SELECT conversation_id, title, workspace_uris, parent_conversation_id, nesting_depth
+        FROM conversation_summaries`).all();
+      for (const row of list) rows.set(String(row.conversation_id), row);
+    } finally {
+      try { db.close(); } catch { /* 已关闭 */ }
+    }
+    summaryCache.set(dbPath, { mtimeMs: st.mtimeMs, rows });
+    return rows;
+  } catch {
+    return null; // 数据库损坏/被占用/运行时无 node:sqlite：静默回退旧逻辑
+  }
+}
+
+function summaryOf(file, cascadeId) {
+  // <root>/<variant>/brain/<cascadeId>/.system_generated/logs/transcript.jsonl
+  const dirs = [
+    path.resolve(file, '..', '..', '..', '..', '..'), // <root>/<variant>
+    path.resolve(file, '..', '..', '..', '..'), // 兼容部分版本把 db 放在 brain/ 下
+  ];
+  for (const dir of dirs) {
+    const dbPath = path.join(dir, 'conversation_summaries.db');
+    if (!fs.existsSync(dbPath)) continue;
+    const rows = readSummaries(dbPath);
+    if (!rows) continue;
+    const row = rows.get(cascadeId);
+    if (row) return row;
+  }
+  return null;
+}
+
+function isSubagent(row) {
+  if (!row) return false;
+  return (row.parent_conversation_id && String(row.parent_conversation_id).trim() !== '') || Number(row.nesting_depth) > 0;
+}
+
 async function read(file) {
   const brainDir = path.resolve(file, '..', '..', '..');
   const cascadeId = path.basename(brainDir);
+  const summary = summaryOf(file, cascadeId);
+  if (isSubagent(summary)) return null; // 子代理会话不单独保存
+  let strippedBlocks = 0;
   const rows = [];
   for await (const line of readLines(file)) {
     if (!line.trim()) continue;
@@ -69,7 +139,11 @@ async function read(file) {
       let role;
       if (r.type === 'USER_INPUT' && (r.source === 'USER_EXPLICIT' || r.source === undefined)) role = 'user';
       else if (r.type === 'PLANNER_RESPONSE' && (r.source === 'MODEL' || r.source === undefined)) role = 'assistant';
-      else continue;
+      else { strippedBlocks++; continue; } // TOOL_* 等非问答步骤
+      if (role === 'assistant') {
+        if (typeof r.thinking === 'string' && r.thinking.trim()) strippedBlocks++;
+        if (Array.isArray(r.tool_calls)) strippedBlocks += r.tool_calls.length;
+      }
       rows.push({ created_at: r.created_at, step_index: r.step_index, role, content: r.content });
     } catch { /* 正在写入的半行 */ }
   }
@@ -87,7 +161,12 @@ async function read(file) {
     else messages.push({ role, content: text, createdAt: Number.isFinite(ts) ? ts : undefined });
   }
   if (!messages.some((m) => m.role === 'user')) return null;
-  return { source: ID, externalId: cascadeId, title: await titleFromBrain(brainDir), messages, ingestMethod: 'local' };
+  const dbTitle = summary && typeof summary.title === 'string' ? summary.title.trim() : '';
+  const title = dbTitle || await titleFromBrain(brainDir);
+  const workspace = summary ? workspaceFromUris(summary.workspace_uris) : undefined;
+  const out = { source: ID, externalId: cascadeId, title, messages, strippedBlocks, ingestMethod: 'local' };
+  if (workspace) out.workspace = workspace;
+  return out;
 }
 
 module.exports = { id: ID, label: 'Antigravity', discover, read, exists };

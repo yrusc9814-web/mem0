@@ -8,6 +8,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
+const net = require('node:net');
 const zlib = require('node:zlib');
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
@@ -34,7 +35,7 @@ Object.assign(process.env, {
 
 const ROOT = path.resolve(__dirname, '..');
 const { dataDir, sourceRoots, mcpToken } = require(path.join(ROOT, 'src/main/paths'));
-const { Store, ALL_SOURCES } = require(path.join(ROOT, 'src/main/db'));
+const { Store, MEMORY_GROUPS, ALL_SOURCES } = require(path.join(ROOT, 'src/main/db'));
 const { LocalIngestor, ADAPTERS } = require(path.join(ROOT, 'src/main/ingest'));
 const { startMcpServer } = require(path.join(ROOT, 'src/main/mcp'));
 const { startBridge } = require(path.join(ROOT, 'src/main/bridge'));
@@ -58,6 +59,26 @@ function write(f, s) { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.wr
 function append(f, s) { fs.appendFileSync(f, s); age(f); }
 const ts = (i) => new Date(Date.UTC(2026, 10, 1, 0, 0, i)).toISOString();
 
+/** 动态空闲端口：先 listen(0) 探一个空闲端口再释放，避免测试固定占用 3790/3791 与其它进程冲突 */
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const s = net.createServer();
+    s.once('error', reject);
+    s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); });
+  });
+}
+
+// 任何未捕获异常/拒绝都必须非 0 退出，绝不允许无输出静默 exit 0
+process.on('unhandledRejection', (e) => { console.error('FATAL unhandledRejection:', e); process.exit(2); });
+process.on('uncaughtException', (e) => { console.error('FATAL uncaughtException:', e); process.exit(2); });
+// 事件循环在测试跑完前耗尽（例如只剩 unref 定时器、某个 Promise 未被 await）时，也必须非 0 退出
+let finished = false;
+process.on('beforeExit', () => {
+  if (finished) return;
+  console.error('FATAL: 测试尚未跑完事件循环就耗尽了（可能有未 await 的 Promise 或仅剩 unref 定时器），拒绝静默 exit 0');
+  process.exit(1);
+});
+
 let storeN = 0;
 function freshStore() { const d = path.join(T, `db${storeN++}`); fs.mkdirSync(d); return Store.open(d); }
 function convs(store, source) { return store.listConversations({ sources: [source], limit: 500 }); }
@@ -76,8 +97,11 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
     assert.equal(r.zcode, R('zcode'));
     assert.equal(r.dimcode, R('dimcode'));
     assert.equal(r.workbuddy, R('workbuddy'));
-    assert.equal(dataDir(), path.join(T, 'data'));
-    assert.ok(!dataDir().startsWith(REAL_HOME) || REAL_HOME === HOME);
+    assert.equal(path.resolve(dataDir()), path.resolve(path.join(T, 'data')));
+    // Windows 的 os.tmpdir() 位于 %USERPROFILE% 下，天然以 REAL_HOME 开头，因此只校验不指向真实 .mem0
+    const realMem0 = path.resolve(path.join(REAL_HOME, '.mem0'));
+    const dd = path.resolve(dataDir());
+    assert.ok(dd !== realMem0 && !dd.startsWith(realMem0 + path.sep), 'dataDir 不得指向真实 .mem0');
     assert.equal(os.homedir(), HOME);
   });
 
@@ -276,6 +300,12 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
         msg('assistant', [{ type: 'thinking', thinking: '只有思考' }]),
       ].join('\n') + '\n');
       assert.equal(await ADAPTERS['claude-code'].read(only), null);
+    });
+    await t('1 claude-code', 'F1 strippedBlocks 精确统计：工具/思考块 + system-reminder + 注入 + meta/sidechain/compact', async () => {
+      const r = await ADAPTERS['claude-code'].read(f);
+      // 5 个 tool_use/tool_result 块 + 3 个注入/中断/续接行 + 2 个 isCompactSummary
+      // + 3 个 system-reminder 块 + 10 个命令包装注入 + isMeta/isSidechain 各 1 + 4 个 thinking/redacted_thinking 块
+      assert.equal(r.strippedBlocks, 29);
     });
   }
 
@@ -483,6 +513,55 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
     store.close();
   }
 
+  // ---------- DeepSeekRuntime 多帧 Zstd 夹具（SPEC 1.1） ----------
+  {
+    const { pathToFileURL } = require('node:url');
+    const fixtureScript = path.join(__dirname, 'fixtures', 'build-fixtures.mjs');
+    const fixture = await import(pathToFileURL(fixtureScript).href);
+    const built = fixture.buildFixtures(path.join(T, 'fixtures-dsh'));
+    const dsh = ADAPTERS['deepseek-harness'];
+
+    await t('1 deepseek-harness', '多帧 Zstd：4 帧拼接完整读出 3 行问答（不止第 1 帧）且 strippedBlocks > 0', async () => {
+      const c = await dsh.read(built.files.dshNormalFile);
+      assert.ok(c);
+      assert.equal(c.externalId, 'dsh-mf-normal-01');
+      assert.deepEqual(c.messages.map((m) => m.role), ['user', 'assistant', 'user']);
+      assert.match(c.messages[0].content, /第一轮提问/);
+      assert.match(c.messages[1].content, /第一轮回答/);
+      assert.doesNotMatch(c.messages[1].content, /分析 Node zlib/); // reasoning 块被剥离
+      assert.match(c.messages[2].content, /第二轮追问/);
+      assert.ok(c.strippedBlocks > 0, `strippedBlocks 应大于 0，实际为 ${c.strippedBlocks}`);
+    });
+
+    await t('1 deepseek-harness', '多帧大容量 subagent：首行提前退出返回 null，无 unhandledRejection/uncaughtException', async () => {
+      const errors = [];
+      const onRejection = (e) => errors.push(e);
+      const onException = (e) => errors.push(e);
+      process.on('unhandledRejection', onRejection);
+      process.on('uncaughtException', onException);
+      try {
+        assert.equal(await dsh.read(built.files.dshSubagentFile), null);
+        await sleep(200); // 给潜在的流销毁错误留出冒泡窗口
+        assert.deepEqual(errors, []);
+      } finally {
+        process.off('unhandledRejection', onRejection);
+        process.off('uncaughtException', onException);
+      }
+    });
+
+    await t('1 deepseek-harness', '普通 jsonl 读取行为不变（非 .zstd 不走多帧解压）', async () => {
+      const f = path.join(T, 'dsh-plain', 'session.jsonl');
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      const hdr = j({ type: 'session', id: 'dsh-plain-01', version: 1, createdAt: 1700000000000, cwd: '/w/dsh' });
+      const um = j({ type: 'user/message', seq: 1, time: 1700000000001, surfaceOp: 'append', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '普通问题' }] } });
+      const am = j({ type: 'assistant/message', seq: 2, time: 1700000000002, surfaceOp: 'append', data: { message: { role: 'assistant', content: [{ type: 'text', text: '普通回答' }] } } });
+      fs.writeFileSync(f, [hdr, um, am].join('\n') + '\n');
+      const c = await dsh.read(f);
+      assert.deepEqual(c.messages.map((m) => m.content), ['普通问题', '普通回答']);
+      assert.equal(c.strippedBlocks, 0);
+    });
+  }
+
   // ---------- Antigravity ----------
   {
     const store = freshStore();
@@ -518,6 +597,77 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       assert.equal(msgs(store, c.id).length, 3);
     });
     store.close();
+  }
+
+  // ---------- Antigravity / Codex 合成夹具（SPEC 1.2 / 1.3） ----------
+  {
+    const { pathToFileURL } = require('node:url');
+    const fixtureScript = path.join(__dirname, 'fixtures', 'build-fixtures.mjs');
+    const fixture = await import(pathToFileURL(fixtureScript).href);
+    const built = fixture.buildFixtures(path.join(T, 'fixtures-g2'));
+
+    await t('1 antigravity', 'conversation_summaries.db 显式列读取：原生 title 优先、Windows workspace 解码、不触发 ERR_OUT_OF_RANGE', async () => {
+      let r;
+      await assert.doesNotReject(async () => { r = await ADAPTERS.antigravity.read(built.files.agMainTranscript); });
+      assert.ok(r);
+      assert.equal(r.externalId, 'ag-main-0001');
+      // 数据库原生标题优先于同目录 task.md 的「旧脑目录回退标题」
+      assert.equal(r.title, '订单服务缓存架构重构');
+      assert.equal(r.workspace, 'd:\\demo-workspace\\order-service');
+      assert.deepEqual(r.messages.map((m) => m.role), ['user', 'assistant']);
+      assert.match(r.messages[0].content, /Redis 缓存雪崩/);
+      assert.match(r.messages[1].content, /随机抖动 TTL/);
+      assert.match(r.messages[1].content, /已完成互斥锁/);
+      // thinking 1 + tool_calls 1 + TOOL_RUN_COMMAND 1
+      assert.equal(r.strippedBlocks, 3);
+    });
+
+    await t('1 antigravity', 'parent_conversation_id 非空 / nesting_depth > 0 的子代理会话返回 null', async () => {
+      assert.equal(await ADAPTERS.antigravity.read(built.files.agSubTranscript), null);
+    });
+
+    await t('1 antigravity', '数据库不存在时静默回退旧逻辑（titleFromBrain，且不填 workspace）', async () => {
+      const brain = path.join(T, 'ag-no-db', 'antigravity', 'brain', 'ag-fallback');
+      const f = path.join(brain, '.system_generated', 'logs', 'transcript.jsonl');
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.copyFileSync(built.files.agMainTranscript, f);
+      fs.writeFileSync(path.join(brain, 'task.md'), '# 回退标题\n');
+      const r = await ADAPTERS.antigravity.read(f);
+      assert.ok(r);
+      assert.equal(r.title, '回退标题');
+      assert.equal(r.workspace, undefined);
+      assert.deepEqual(r.messages.map((m) => m.role), ['user', 'assistant']);
+    });
+
+    const codexDay = path.join(built.roots.codex, 'sessions', '2026', '11', '15');
+    const codexMain = path.join(codexDay, 'rollout-2026-11-15T10-00-00-019a1111-2222-7333-8444-555555550001.jsonl');
+    const codexSub = path.join(codexDay, 'rollout-2026-11-15T10-05-00-019a1111-2222-7333-8444-555555550002.jsonl');
+
+    await t('1 codex', 'session_meta.payload.source.subagent 为对象 → 子代理会话返回 null', async () => {
+      assert.equal(await ADAPTERS.codex.read(codexSub, built.roots.codex), null);
+    });
+
+    await t('1 codex', 'session_meta.payload.source.subagent 为非空字符串 → 同样返回 null', async () => {
+      const dir = path.join(T, 'codex-str-sub');
+      const f = path.join(dir, 'rollout-str-sub.jsonl');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(f, [
+        j({ type: 'session_meta', payload: { id: 'codex-str-sub', cwd: '/w/sub', source: { subagent: 'review' } } }),
+        j({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '子代理问题' }] } }),
+      ].join('\n') + '\n');
+      assert.equal(await ADAPTERS.codex.read(f, dir), null);
+    });
+
+    await t('1 codex', '主会话正常入库且 strippedBlocks > 0（注入 / function_call / function_call_output）', async () => {
+      const r = await ADAPTERS.codex.read(codexMain, built.roots.codex);
+      assert.ok(r);
+      assert.equal(r.title, 'Postgres 索引在线创建检查');
+      assert.deepEqual(r.messages.map((m) => m.content), [
+        '大表加复合索引怎样避免锁表阻塞线上写入？',
+        '使用 CREATE INDEX CONCURRENTLY，并确保该语句不在显式事务块内执行。',
+      ]);
+      assert.equal(r.strippedBlocks, 3);
+    });
   }
 
   // ---------- ZCode ----------
@@ -926,6 +1076,12 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       assert.deepEqual(a, b);
       assert.equal(JSON.stringify(a), JSON.stringify(b));
     };
+    /** 0.6.0：deepseek-harness 返回对象新增 strippedBlocks，与旧实现对照时先剔除该统计字段 */
+    const withoutStripped = (r) => {
+      if (!r) return r;
+      const { strippedBlocks, ...rest } = r;
+      return rest;
+    };
 
     // 参考实现：claude-code（整文件读取版，语义与逐行版一致）
     const oldClaude = async (file) => {
@@ -1068,7 +1224,8 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
         j({ type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '最后一行无换行' }] } }),
       ].join('\n'));
       const now = await ADAPTERS.codex.read(nf, root);
-      same(now, await oldCodex.read(nf, root));
+      same(withoutStripped(now), await oldCodex.read(nf, root));
+      assert.equal(now.strippedBlocks, 2); // 环境注入 1 + event_msg 1
       assert.equal(now.title, '流式 Codex');
 
       const of = put('codex-root/archived_sessions/rollout-old.jsonl', [
@@ -1078,7 +1235,7 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
         'broken',
         j({ type: 'message', role: 'assistant', content: '旧格式回答' }),
       ].join('\n'));
-      same(await ADAPTERS.codex.read(of, root), await oldCodex.read(of, root));
+      same(withoutStripped(await ADAPTERS.codex.read(of, root)), await oldCodex.read(of, root));
     });
 
     // 旧实现：antigravity
@@ -1137,7 +1294,8 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
         j({ step_index: 5, type: 'USER_INPUT', source: 'USER_EXPLICIT', content: '最后一行无换行' }),
       ].join('\n'));
       const now = await ADAPTERS.antigravity.read(f);
-      same(now, await oldAntigravity(f));
+      same(withoutStripped(now), await oldAntigravity(f));
+      assert.equal(now.strippedBlocks, 1); // TOOL_RUN_COMMAND 1
       assert.equal(now.title, '流式 AG');
     });
 
@@ -1152,7 +1310,8 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
         j({ step_index: 3, source: 'MODEL', type: 'TOOL_CALL', created_at: '2026-11-01T00:00:03Z', content: '工具行', tool_calls: [{ name: 'bash' }] }),
       ].join('\n'));
       const now = await ADAPTERS.antigravity.read(f);
-      same(now, await oldAntigravity(f));
+      same(withoutStripped(now), await oldAntigravity(f));
+      assert.equal(now.strippedBlocks, 5); // 两轮 thinking + tool_calls 各 2，加 TOOL_CALL 1
       assert.deepEqual(now.messages.map((m) => m.content), ['重字段问题', '先回答\n\n再回答']);
     });
 
@@ -1169,7 +1328,8 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       assert.equal(mid.title, '中间标题');
       const none = await ADAPTERS.antigravity.read(mk('ag-title-3', '没有标题\n## 二级\n'));
       assert.equal(none.title, undefined);
-      same(none, await oldAntigravity(path.join(dir, 'gemini/antigravity/brain/ag-title-3/.system_generated/logs/transcript.jsonl')));
+      same(withoutStripped(none), await oldAntigravity(path.join(dir, 'gemini/antigravity/brain/ag-title-3/.system_generated/logs/transcript.jsonl')));
+      assert.equal(none.strippedBlocks, 0);
     });
 
     // 旧实现：workbuddy
@@ -1325,18 +1485,19 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
         um(5, '最后一行无换行'),
       ].join('\n');
       const plain = put('dsh/p/s1/session.jsonl', lines);
-      same(await ADAPTERS['deepseek-harness'].read(plain), await oldDeepseek(plain));
+      same(withoutStripped(await ADAPTERS['deepseek-harness'].read(plain)), await oldDeepseek(plain));
       assert.equal((await ADAPTERS['deepseek-harness'].read(plain)).title, 'DSH 流式标题');
+      assert.equal((await ADAPTERS['deepseek-harness'].read(plain)).strippedBlocks, 1);
 
       const zf = put('dsh/p/s2/session.v2.jsonl.zstd', 'placeholder');
       fs.writeFileSync(zf, zlib.zstdCompressSync(Buffer.from(lines)));
-      same(await ADAPTERS['deepseek-harness'].read(zf), await oldDeepseek(zf));
+      same(withoutStripped(await ADAPTERS['deepseek-harness'].read(zf)), await oldDeepseek(zf));
 
       // 空文件 / 坏 header 都返回 null，与旧实现一致
       const empty = put('dsh/p/s3/session.jsonl', '');
-      same(await ADAPTERS['deepseek-harness'].read(empty), await oldDeepseek(empty));
+      same(withoutStripped(await ADAPTERS['deepseek-harness'].read(empty)), await oldDeepseek(empty));
       const badHeader = put('dsh/p/s4/session.jsonl', '{"type":"sess');
-      same(await ADAPTERS['deepseek-harness'].read(badHeader), await oldDeepseek(badHeader));
+      same(withoutStripped(await ADAPTERS['deepseek-harness'].read(badHeader)), await oldDeepseek(badHeader));
     });
   }
 
@@ -1727,19 +1888,19 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
   {
     const store = freshStore();
     store.upsertConversation({ source: 'codex', externalId: 'm1', ingestMethod: 'local', title: 'MCP 会话', messages: Array.from({ length: 30 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: `message number ${i} kubernetes`, createdAt: 1700000000000 + i })) });
-    const port = 3790;
+    const port = await freePort();
     let mcp;
-    await t('3 mcp', '在 127.0.0.1:3790 启动，对外地址带 token', async () => {
+    await t('3 mcp', `在 127.0.0.1:${port} 启动，对外地址带 token`, async () => {
       mcp = await startMcpServer(store, { port });
       assert.equal(mcp.token, mcpToken(dataDir()));
-      assert.equal(mcp.url, `http://127.0.0.1:3790/mcp?token=${encodeURIComponent(mcp.token)}`);
+      assert.equal(mcp.url, `http://127.0.0.1:${port}/mcp?token=${encodeURIComponent(mcp.token)}`);
       assert.ok(!mcp.url.endsWith('/mcp'));
     });
     await t('3 mcp', '密钥文件：首次生成后复用（再次启动/再次读取都是同一个 token）', async () => {
       const file = path.join(dataDir(), 'mcp-token');
       assert.equal(fs.readFileSync(file, 'utf8').trim(), mcp.token);
       assert.equal(mcpToken(dataDir()), mcp.token);
-      assert.equal((fs.statSync(file).mode & 0o777).toString(8), '600');
+      if (process.platform !== 'win32') assert.equal((fs.statSync(file).mode & 0o777).toString(8), '600');
       const again = await startMcpServer(store, { port: 0 });
       assert.equal(again.token, mcp.token);
       assert.equal(again.url, `http://127.0.0.1:0/mcp?token=${encodeURIComponent(mcp.token)}`);
@@ -1759,10 +1920,10 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
     const init = j({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 't', version: '1' } } });
     if (mcp) {
       const client = new Client({ name: 'indep', version: '1' });
-      await t('3 mcp', 'SDK 客户端连接，仅列出 list_conversations / recall 两个工具', async () => {
+      await t('3 mcp', 'SDK 客户端连接，列出 4 个工具（get_memory_context / list_conversations / recall / save_memory）', async () => {
         await client.connect(new StreamableHTTPClientTransport(new URL(mcp.url)));
         const { tools } = await client.listTools();
-        assert.deepEqual(tools.map((x) => x.name).sort(), ['list_conversations', 'recall']);
+        assert.deepEqual(tools.map((x) => x.name).sort(), ['get_memory_context', 'list_conversations', 'recall', 'save_memory']);
         assert.ok(client.getInstructions() && client.getInstructions().includes('recall'));
       });
       const day0 = (() => { const d = new Date(1700000000000); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; })();
@@ -1829,8 +1990,8 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
         assert.ok(JSON.parse((await raw({ path: `/mcp?token=${encodeURIComponent(mcp.token)}` }, initBody)).body).result);
       });
       await t('3 mcp', 'Host / Origin 校验仍在密钥之前（外站 Host + 正确密钥 → 403，不是 401）', async () => {
-        assert.equal((await raw({ noAuth: true, headers: { host: 'evil.com:3790' } }, initBody)).status, 403);
-        assert.equal((await raw({ headers: { host: 'evil.com:3790' } }, initBody)).status, 403);
+        assert.equal((await raw({ noAuth: true, headers: { host: `evil.com:${port}` } }, initBody)).status, 403);
+        assert.equal((await raw({ headers: { host: `evil.com:${port}` } }, initBody)).status, 403);
         assert.equal((await raw({ headers: { origin: 'https://evil.com' } }, initBody)).status, 403);
       });
       await t('3 mcp', 'SDK 客户端：查询参数地址与 Bearer 头两种接法都能调工具', async () => {
@@ -1860,18 +2021,18 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
         assert.equal((await raw({ path: '/health', method: 'GET', noAuth: true })).status, 200, '健康检查不含数据，无需密钥');
       });
       await t('3 mcp', 'Host 校验：DNS rebinding 风格 Host 全部 403', async () => {
-        for (const h of ['evil.com', 'evil.com:3790', '127.0.0.1.evil.com:3790', 'localhost.evil.com:3790', '127.0.0.1', '127.0.0.1:80', '[::1]:3790', '0.0.0.0:3790', 'LOCALHOST:3790x']) {
+        for (const h of ['evil.com', `evil.com:${port}`, `127.0.0.1.evil.com:${port}`, `localhost.evil.com:${port}`, '127.0.0.1', '127.0.0.1:80', `[::1]:${port}`, `0.0.0.0:${port}`, `LOCALHOST:${port}x`]) {
           const r = await raw({ headers: { host: h } }, init);
           assert.equal(r.status, 403, `Host ${j(h)} -> ${r.status}`);
         }
         assert.equal((await raw({ headers: { host: `localhost:${port}` } }, init)).status, 200);
       });
       await t('3 mcp', 'Origin 校验：外站/null/伪装前缀 403', async () => {
-        for (const o of ['https://evil.com', 'http://evil.com', 'null', 'http://127.0.0.1.evil.com', 'http://localhost.evil.com:3790', 'http://localhost@evil.com', 'file://', 'chrome-extension://abc']) {
+        for (const o of ['https://evil.com', 'http://evil.com', 'null', 'http://127.0.0.1.evil.com', `http://localhost.evil.com:${port}`, 'http://localhost@evil.com', 'file://', 'chrome-extension://abc']) {
           const r = await raw({ headers: { origin: o } }, init);
           assert.equal(r.status, 403, `Origin ${o} -> ${r.status}`);
         }
-        assert.equal((await raw({ headers: { origin: 'http://localhost:3790' } }, init)).status, 200);
+        assert.equal((await raw({ headers: { origin: `http://localhost:${port}` } }, init)).status, 200);
       });
       await t('3 mcp', '[信息] 任意本机端口的网页 Origin（如 http://localhost:5173）被放行', async () => {
         const r = await raw({ headers: { origin: 'http://localhost:5173' } }, init);
@@ -1888,15 +2049,10 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
         assert.ok(err && (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET'), `关闭后仍能连接：${err && err.code}`);
       });
       await t('3 mcp', 'close()：有卡住的在途请求时最多等 1 秒即强制关闭', async () => {
-        const net = require('node:net');
         // 先占一个空闲端口（port:0 时返回对象里的 port 是请求值 0，不能直接用来连接）
-        const freePort = await new Promise((resolve, reject) => {
-          const s = net.createServer();
-          s.once('error', reject);
-          s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); });
-        });
-        const m2 = await startMcpServer(store, { port: freePort });
-        const stuck = http.request({ agent: false, host: '127.0.0.1', port: freePort, path: '/mcp', method: 'POST', headers: { 'content-type': 'application/json', host: `127.0.0.1:${freePort}`, authorization: `Bearer ${m2.token}` } }, () => {});
+        const m2Port = await freePort();
+        const m2 = await startMcpServer(store, { port: m2Port });
+        const stuck = http.request({ agent: false, host: '127.0.0.1', port: m2Port, path: '/mcp', method: 'POST', headers: { 'content-type': 'application/json', host: `127.0.0.1:${m2Port}`, authorization: `Bearer ${m2.token}` } }, () => {});
         stuck.on('error', () => {});
         stuck.write('{"jsonrpc":"2.0","id":9,"method":"initialize","params":{}'); // 不结束请求体 → 在途
         await sleep(50);
@@ -1915,14 +2071,1469 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
   }
 
   // =====================================================================
+  // 2d. SQLite v2 迁移与记忆/事项基础读写（SPEC 2.1 / 2.3）
+  // =====================================================================
+  {
+    // 0.5.5 的 v1 建表语句（逐字复制旧 migrate()），用于手工造一个存量旧库
+    const V1_DDL = `
+      CREATE TABLE IF NOT EXISTS conversations (
+        id            TEXT PRIMARY KEY,
+        source        TEXT NOT NULL,
+        external_id   TEXT NOT NULL,
+        title         TEXT,
+        url           TEXT,
+        workspace     TEXT,
+        created_at    INTEGER,
+        updated_at    INTEGER,
+        message_count INTEGER NOT NULL DEFAULT 0,
+        ingest_method TEXT NOT NULL CHECK (ingest_method IN ('local','browser-extension')),
+        UNIQUE(source, external_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_conv_source ON conversations(source, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS messages (
+        id              TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        seq             INTEGER NOT NULL,
+        role            TEXT NOT NULL,
+        content         TEXT NOT NULL,
+        created_at      INTEGER,
+        UNIQUE(conversation_id, seq)
+      );
+      CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, seq);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        content, content='messages', content_rowid='rowid', tokenize='trigram'
+      );
+      CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+        INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+      END;
+      CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+      END;
+      CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+        INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+      END;
+
+      CREATE TABLE IF NOT EXISTS file_cursors (
+        path      TEXT PRIMARY KEY,
+        source    TEXT NOT NULL,
+        size      INTEGER NOT NULL,
+        mtime_ms  INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS source_settings (
+        source  TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL DEFAULT 1
+      );
+
+      CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+
+      CREATE TABLE IF NOT EXISTS deleted_conversations (
+        id          TEXT PRIMARY KEY,
+        msg_count   INTEGER NOT NULL,
+        deleted_at  INTEGER NOT NULL
+      );
+    `;
+    const v1dir = path.join(T, 'db-v1');
+    fs.mkdirSync(v1dir);
+    {
+      const old = new DatabaseSync(path.join(v1dir, 'mem0.db'));
+      old.exec('PRAGMA journal_mode = WAL;');
+      old.exec(V1_DDL);
+      old.prepare(`INSERT INTO conversations(id, source, external_id, title, url, workspace, created_at, updated_at, message_count, ingest_method)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run('conv-old', 'claude-code', 'old-1', '旧库会话标题', 'https://example.com/old', '/home/me/proj', 1700000000000, 1700000005000, 2, 'local');
+      const ins = old.prepare('INSERT INTO messages(id, conversation_id, seq, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+      ins.run('msg-old-0', 'conv-old', 0, 'user', '旧库检索关键词：迁移前的问题', 1700000000000);
+      ins.run('msg-old-1', 'conv-old', 1, 'assistant', '旧库回答：保留全部历史正文', 1700000005000);
+      old.prepare('INSERT INTO file_cursors(path, source, size, mtime_ms) VALUES (?, ?, ?, ?)')
+        .run('/home/me/.claude/old.jsonl', 'claude-code', 4096, 1700000005000);
+      old.exec('PRAGMA user_version = 1');
+      old.close();
+    }
+
+    let store = Store.open(v1dir);
+
+    await t('2d v2 迁移', 'v1 旧库无损升到 v2：旧行逐列一致、游标保留、FTS 照常', () => {
+      assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 2);
+      const conv = store.db.prepare(`SELECT id, source, external_id, title, url, workspace, created_at, updated_at, message_count, ingest_method
+        FROM conversations WHERE id = ?`).get('conv-old');
+      assert.deepEqual({ ...conv }, {
+        id: 'conv-old', source: 'claude-code', external_id: 'old-1', title: '旧库会话标题',
+        url: 'https://example.com/old', workspace: '/home/me/proj', created_at: 1700000000000,
+        updated_at: 1700000005000, message_count: 2, ingest_method: 'local',
+      });
+      const rows = store.db.prepare('SELECT id, conversation_id, seq, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY seq').all('conv-old');
+      assert.deepEqual(rows.map((r) => ({ ...r })), [
+        { id: 'msg-old-0', conversation_id: 'conv-old', seq: 0, role: 'user', content: '旧库检索关键词：迁移前的问题', created_at: 1700000000000 },
+        { id: 'msg-old-1', conversation_id: 'conv-old', seq: 1, role: 'assistant', content: '旧库回答：保留全部历史正文', created_at: 1700000005000 },
+      ]);
+      assert.deepEqual(store.db.prepare('SELECT path, source, size, mtime_ms FROM file_cursors').all().map((r) => ({ ...r })), [
+        { path: '/home/me/.claude/old.jsonl', source: 'claude-code', size: 4096, mtime_ms: 1700000005000 },
+      ]);
+      const hits = store.search('旧库检索关键词');
+      assert.equal(hits.length, 1);
+      assert.equal(hits[0].conversationId, 'conv-old');
+    });
+
+    await t('2d v2 迁移', '新增 10 列默认值正确，idx_conv_project 已建', () => {
+      const c = store.db.prepare(`SELECT project_id, summary, decisions_json, next_step, original_title,
+        title_locked, project_locked, stripped_blocks, ai_organized_at, ai_msg_watermark
+        FROM conversations WHERE id = 'conv-old'`).get();
+      assert.deepEqual({ ...c }, {
+        project_id: null, summary: '', decisions_json: '[]', next_step: '', original_title: null,
+        title_locked: 0, project_locked: 0, stripped_blocks: 0, ai_organized_at: null, ai_msg_watermark: 0,
+      });
+      assert.equal(store.db.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE type = 'index' AND name = 'idx_conv_project'").get().n, 1);
+      assert.equal(store.db.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE type = 'table' AND name IN ('projects', 'memories', 'memories_fts')").get().n, 3);
+    });
+
+    await t('2d v2 迁移', '重复打开幂等：不重复加列、不丢数据、版本仍为 2', () => {
+      store.close();
+      store = Store.open(v1dir);
+      store.close();
+      store = Store.open(v1dir);
+      assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 2);
+      const cols = store.db.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name);
+      assert.equal(cols.length, 21, `v1 的 10 列 + v2 的 11 列（含 summary_locked），实际 ${cols.length}`);
+      assert.equal(cols.filter((c) => c === 'summary_locked').length, 1);
+      assert.equal(cols.filter((c) => c === 'project_id').length, 1);
+      assert.equal(store.db.prepare('SELECT COUNT(*) n FROM messages').get().n, 2);
+      assert.equal(store.getConversation('conv-old', { limit: 10 }).messages.length, 2);
+      assert.equal(store.search('旧库检索关键词').length, 1);
+    });
+
+    await t('2d v2 迁移', '半迁移状态重入：已存在的列不重复 ADD，缺的列补齐', () => {
+      const pdir = path.join(T, 'db-partial');
+      fs.mkdirSync(pdir);
+      const raw = new DatabaseSync(path.join(pdir, 'mem0.db'));
+      raw.exec(V1_DDL);
+      raw.exec("ALTER TABLE conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''");
+      raw.exec('PRAGMA user_version = 1');
+      raw.close();
+      const ps = Store.open(pdir);
+      const cols = ps.db.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name);
+      assert.equal(cols.filter((c) => c === 'summary').length, 1);
+      assert.equal(cols.length, 21);
+      assert.equal(cols.filter((c) => c === 'summary_locked').length, 1);
+      assert.equal(ps.db.prepare('PRAGMA user_version').get().user_version, 2);
+      ps.close();
+    });
+
+    await t('2d v2 迁移', '空库：0 卡 0 事项，无演示数据；MEMORY_GROUPS 固定 4 组', () => {
+      const empty = freshStore();
+      assert.equal(empty.db.prepare('PRAGMA user_version').get().user_version, 2);
+      assert.equal(empty.db.prepare('SELECT COUNT(*) n FROM memories').get().n, 0);
+      assert.equal(empty.db.prepare('SELECT COUNT(*) n FROM projects').get().n, 0);
+      assert.deepEqual(empty.listMemories(), []);
+      assert.deepEqual(empty.listProjects({ includeArchived: true }), []);
+      assert.deepEqual(MEMORY_GROUPS, ['个人与职业背景', '协作与沟通准则', '环境与工作流', '踩坑与经验库']);
+      for (const g of MEMORY_GROUPS) assert.deepEqual(empty.listMemories({ group: g }), [], g);
+      empty.close();
+    });
+
+    await t('2d 记忆卡', '新建/读取/更新/删除：JSON 列解析成数组，新卡追加到分组末尾', () => {
+      const s = freshStore();
+      const a = s.saveMemory({ group: '踩坑与经验库', title: 'FTS5 trigram 坑', body: '中文两字搜不到', tags: ['SQLite', '检索'], sourceIds: ['conv-old'] });
+      assert.ok(a.id);
+      assert.equal(a.originLabel, '手动录入');
+      assert.deepEqual(a.tags, ['SQLite', '检索']);
+      assert.deepEqual(a.sourceIds, ['conv-old']);
+      assert.equal(a.sortOrder, 0);
+      const b = s.saveMemory({ group: '踩坑与经验库', title: '第二张', body: '正文', tags: [], sourceIds: [] });
+      assert.equal(b.sortOrder, 1);
+      const c = s.saveMemory({ group: '个人与职业背景', title: '画像卡', body: '十年后端', originLabel: '手动录入' });
+      assert.equal(c.sortOrder, 0, '各分组独立从 0 开始');
+      assert.deepEqual(s.listMemories().map((x) => x.title), ['画像卡', 'FTS5 trigram 坑', '第二张']);
+      assert.deepEqual(s.listMemories({ group: '踩坑与经验库' }).map((x) => x.title), ['FTS5 trigram 坑', '第二张']);
+      assert.equal(s.getMemory(a.id).title, 'FTS5 trigram 坑');
+      assert.equal(s.getMemory('nope'), null);
+      const upd = s.saveMemory({ id: a.id, group: '踩坑与经验库', title: 'FTS5 trigram 坑（改）', body: '新正文', tags: ['SQLite'], sourceIds: ['c2'], superseded: '旧正文' });
+      assert.equal(upd.createdAt, a.createdAt);
+      assert.equal(upd.sortOrder, 0);
+      assert.deepEqual(upd.tags, ['SQLite']);
+      assert.deepEqual(upd.sourceIds, ['c2']);
+      assert.equal(upd.superseded, '旧正文');
+      const del = s.deleteMemory(a.id);
+      assert.equal(del.title, 'FTS5 trigram 坑（改）');
+      assert.deepEqual(del.tags, ['SQLite']);
+      assert.equal(s.getMemory(a.id), null);
+      assert.equal(s.deleteMemory(a.id), null);
+      assert.throws(() => s.saveMemory({ group: '不存在的分组', title: 'x', body: 'y' }), /unknown memory group/);
+      assert.throws(() => s.saveMemory({ group: '踩坑与经验库', title: '  ', body: 'y' }), /title required/);
+      s.close();
+    });
+
+    await t('2d 记忆卡', 'memories_fts 触发器：插入可命中，更新后旧词失效、新词命中，删除后清空', () => {
+      const s = freshStore();
+      const card = s.saveMemory({ group: '踩坑与经验库', title: 'Electron 打包签名', body: 'Windows 代码签名证书过期', tags: ['Electron'] });
+      const fts = (q) => s.db.prepare('SELECT m.id FROM memories_fts f JOIN memories m ON m.rowid = f.rowid WHERE memories_fts MATCH ?').all(`"${q}"`).map((r) => r.id);
+      assert.deepEqual(fts('代码签名'), [card.id]);
+      assert.deepEqual(fts('打包签名'), [card.id]);
+      s.saveMemory({ id: card.id, group: '踩坑与经验库', title: card.title, body: '改成 notarize 公证问题', tags: ['Electron'] });
+      assert.deepEqual(fts('代码签名'), []);
+      assert.deepEqual(fts('notarize'), [card.id]);
+      s.deleteMemory(card.id);
+      assert.deepEqual(fts('notarize'), []);
+      s.db.exec("INSERT INTO memories_fts(memories_fts, rank) VALUES ('integrity-check', 1)");
+      s.close();
+    });
+
+    await t('2d 记忆卡', 'moveMemory：delta 在 scopeIds 可见顺序内上下移动并重排 sort_order', () => {
+      const s = freshStore();
+      const g = '协作与沟通准则';
+      const a = s.saveMemory({ group: g, title: 'A', body: 'a' });
+      const b = s.saveMemory({ group: g, title: 'B', body: 'b' });
+      const c = s.saveMemory({ group: g, title: 'C', body: 'c' });
+      const order = () => s.listMemories({ group: g }).map((x) => x.title);
+      assert.deepEqual(order(), ['A', 'B', 'C']);
+      s.moveMemory(b.id, { delta: -1, scopeIds: [a.id, b.id, c.id] });
+      assert.deepEqual(order(), ['B', 'A', 'C']);
+      s.moveMemory(b.id, { delta: 5, scopeIds: [b.id, a.id, c.id] });
+      assert.deepEqual(order(), ['A', 'C', 'B'], '越界 delta 收敛到末尾');
+      s.moveMemory(b.id, { delta: -5, scopeIds: [a.id, c.id, b.id] });
+      assert.deepEqual(order(), ['B', 'A', 'C'], '越界 delta 收敛到开头');
+      assert.deepEqual(s.listMemories({ group: g }).map((x) => x.sortOrder), [0, 1, 2]);
+      assert.equal(s.moveMemory('nope', { delta: 1 }), null);
+      s.close();
+    });
+
+    await t('2d 记忆卡', 'moveMemory：targetGroup 跨组移到目标组末尾', () => {
+      const s = freshStore();
+      const a = s.saveMemory({ group: '个人与职业背景', title: 'A', body: 'a' });
+      const b = s.saveMemory({ group: '环境与工作流', title: 'B', body: 'b' });
+      const moved = s.moveMemory(a.id, { targetGroup: '环境与工作流' });
+      assert.equal(moved.group, '环境与工作流');
+      assert.equal(moved.sortOrder, 1);
+      assert.deepEqual(s.listMemories({ group: '环境与工作流' }).map((x) => x.title), ['B', 'A']);
+      assert.deepEqual(s.listMemories({ group: '个人与职业背景' }), []);
+      assert.throws(() => s.moveMemory(b.id, { targetGroup: '非法分组' }), /unknown memory group/);
+      s.close();
+    });
+
+    await t('2d 推进事项', '新建/读取/更新/归档过滤/删除：JSON 列解析成数组', () => {
+      const s = freshStore();
+      const p = s.saveProject({ name: 'v0.6.0 升级', state: '推进中', workspace: 'D:\\work\\mem0', progress: '写迁移', decisions: ['用 FTS5', '零新依赖'], rejected: ['Elasticsearch'], nextStep: '补测试' });
+      assert.ok(p.id);
+      assert.equal(p.archived, false);
+      assert.deepEqual(p.decisions, ['用 FTS5', '零新依赖']);
+      assert.deepEqual(p.rejected, ['Elasticsearch']);
+      const q = s.saveProject({ name: '已结项事项', archived: true });
+      assert.equal(q.state, '推进中', 'state 默认推进中');
+      assert.equal(q.workspace, null);
+      assert.deepEqual(q.decisions, []);
+      assert.deepEqual(s.listProjects().map((x) => x.name), ['v0.6.0 升级']);
+      assert.deepEqual(s.listProjects({ includeArchived: true }).map((x) => x.name).sort(), ['v0.6.0 升级', '已结项事项'].sort());
+      assert.equal(s.getProject(p.id).progress, '写迁移');
+      assert.equal(s.getProject('nope'), null);
+      const upd = s.saveProject({ id: p.id, name: 'v0.6.0 升级', state: '待验证', progress: '迁移完成', decisions: ['用 FTS5', '零新依赖', 'JSON 数组化'], nextStep: '跑门禁' });
+      assert.equal(upd.state, '待验证');
+      assert.deepEqual(upd.decisions, ['用 FTS5', '零新依赖', 'JSON 数组化']);
+      assert.deepEqual(upd.rejected, ['Elasticsearch'], '未传字段保持原值');
+      assert.equal(upd.workspace, 'D:\\work\\mem0');
+      assert.equal(upd.createdAt, p.createdAt);
+      assert.throws(() => s.saveProject({ name: '  ' }), /project name required/);
+      const del = s.deleteProject(q.id);
+      assert.equal(del.name, '已结项事项');
+      assert.equal(s.getProject(q.id), null);
+      assert.equal(s.deleteProject(q.id), null);
+      s.close();
+    });
+
+    await t('2d 推进事项', 'deleteProject 解除关联会话 project_id（会话本身保留）', () => {
+      const s = freshStore();
+      const up = s.upsertConversation({ source: 'claude-code', externalId: 'p1', ingestMethod: 'local', messages: [{ role: 'user', content: '事项关联会话' }] });
+      const other = s.upsertConversation({ source: 'codex', externalId: 'p2', ingestMethod: 'local', messages: [{ role: 'user', content: '无关会话' }] });
+      const p = s.saveProject({ name: '关联事项' });
+      s.db.prepare('UPDATE conversations SET project_id = ? WHERE id = ?').run(p.id, up.id);
+      assert.equal(s.db.prepare('SELECT project_id FROM conversations WHERE id = ?').get(up.id).project_id, p.id);
+      s.deleteProject(p.id);
+      assert.equal(s.db.prepare('SELECT project_id FROM conversations WHERE id = ?').get(up.id).project_id, null);
+      assert.equal(s.db.prepare('SELECT project_id FROM conversations WHERE id = ?').get(other.id).project_id, null);
+      assert.equal(s.getProject(p.id), null);
+      assert.equal(s.getConversation(up.id, { limit: 10 }).messages.length, 1);
+      s.close();
+    });
+
+    store.close();
+  }
+
+  // =====================================================================
+  // 2e. H2：工作区自动归属、静默加锁、列表/统计/搜索扩展（SPEC 2.2 第 1-3 点）
+  // =====================================================================
+  {
+    const store = freshStore();
+    const up = (externalId, messages, extra = {}) => store.upsertConversation({ source: 'claude-code', externalId, ingestMethod: 'local', messages, ...extra });
+    const rowOf = (externalId) => store.db.prepare("SELECT * FROM conversations WHERE source='claude-code' AND external_id=?").get(externalId);
+    const msg = (text) => [{ role: 'user', content: text }];
+
+    const winProj = store.saveProject({ name: 'Windows 事项', workspace: 'D:\\Work\\Mem0\\' });
+
+    await t('2e 工作区归属', 'matchProjectByWorkspace：Windows 盘符大小写/反斜杠/尾部斜杠归一化，POSIX 路径相等与子目录命中', () => {
+      assert.equal(store.matchProjectByWorkspace('d:/work/mem0').id, winProj.id);
+      assert.equal(store.matchProjectByWorkspace('D:\\Work\\Mem0\\source\\desktop').id, winProj.id);
+      assert.equal(store.matchProjectByWorkspace('d:/work/mem0-other'), null, '前缀近似但不是子目录');
+      const posixProj = store.saveProject({ name: 'POSIX 事项', workspace: '/home/me/app/' });
+      assert.equal(store.matchProjectByWorkspace('/home/me/app').id, posixProj.id);
+      assert.equal(store.matchProjectByWorkspace('/home/me/app/src/').id, posixProj.id);
+      assert.equal(store.matchProjectByWorkspace('/home/me/application'), null);
+      assert.equal(store.matchProjectByWorkspace(''), null);
+      assert.equal(store.matchProjectByWorkspace(null), null);
+    });
+
+    await t('2e 工作区归属', '多个命中取归一化路径最长（最具体）的事项；已归档事项不参与', () => {
+      const parent = store.saveProject({ name: '父事项', workspace: '/w/app' });
+      const child = store.saveProject({ name: '子事项', workspace: '/w/app/api' });
+      assert.equal(store.matchProjectByWorkspace('/w/app/api/handler.js').id, child.id);
+      assert.equal(store.matchProjectByWorkspace('/w/app/web').id, parent.id);
+      assert.equal(store.matchProjectByWorkspace('/w/app').id, parent.id);
+      up('h2-arch', msg('归档工作区里的会话'), { workspace: '/w/old/x' });
+      store.saveProject({ name: '已结项事项', workspace: '/w/old', archived: true });
+      assert.equal(store.matchProjectByWorkspace('/w/old/x'), null, '归档事项不参与匹配');
+      assert.equal(rowOf('h2-arch').project_id, null, '归档事项不自动收编存量会话');
+    });
+
+    await t('2e 工作区归属', '入库带 workspace 自动关联；事项后建/改 workspace 时扫描存量未锁定未关联会话', () => {
+      up('h2-a', msg('子目录里的会话'), { workspace: 'd:/work/mem0/source/desktop' });
+      assert.equal(rowOf('h2-a').project_id, winProj.id);
+      up('h2-b', msg('先入库的会话'), { workspace: '/w/late/pkg' });
+      assert.equal(rowOf('h2-b').project_id, null);
+      const late = store.saveProject({ name: '后建事项', workspace: '/w/late' });
+      assert.equal(rowOf('h2-b').project_id, late.id, 'saveProject 应扫描存量会话');
+      up('h2-move', msg('待收编会话'), { workspace: '/w/moved/pkg' });
+      const movedProj = store.saveProject({ name: '搬迁事项' });
+      assert.equal(rowOf('h2-move').project_id, null);
+      store.saveProject({ id: movedProj.id, name: '搬迁事项', workspace: '/w/moved' });
+      assert.equal(rowOf('h2-move').project_id, movedProj.id, '修改事项 workspace 也应扫描存量会话');
+    });
+
+    await t('2e 静默加锁', '改标题置 title_locked，重新 upsert 不覆盖库内标题', () => {
+      const conv = up('h2-lock', msg('原始问题'), { workspace: 'd:/work/mem0/x', title: '采集标题' });
+      assert.equal(rowOf('h2-lock').project_id, winProj.id);
+      store.updateConversationMeta(conv.id, { title: '手动标题' });
+      assert.equal(rowOf('h2-lock').title_locked, 1);
+      up('h2-lock', [...msg('原始问题'), { role: 'assistant', content: 'AI 回答' }], { workspace: 'd:/work/mem0/x', title: '采集器重新推算的标题' });
+      assert.equal(rowOf('h2-lock').title, '手动标题');
+    });
+
+    await t('2e 静默加锁', '改事项（含置 null）置 project_locked，重新 upsert 不被工作区自动覆盖', () => {
+      const conv = rowOf('h2-lock');
+      store.updateConversationMeta(conv.id, { projectId: null });
+      assert.equal(rowOf('h2-lock').project_locked, 1);
+      assert.equal(rowOf('h2-lock').project_id, null);
+      up('h2-lock', [...msg('原始问题'), { role: 'assistant', content: 'AI 回答' }, { role: 'user', content: '继续追问' }], { workspace: 'd:/work/mem0/x' });
+      assert.equal(rowOf('h2-lock').project_id, null, '锁定后不得被工作区自动覆盖');
+      // 锁定的项目不被其它路径影响；未锁定会话仍可正常归属
+      assert.equal(store.matchProjectByWorkspace('d:/work/mem0/x').id, winProj.id);
+    });
+
+    await t('2e original_title', '首次插入记录 deriveTitle，后续改标题/重新 upsert 均不变；显式传入截断 300', () => {
+      const conv = up('h2-orig', msg('首条用户提问用来做原始标题'), { title: '采集标题' });
+      assert.equal(rowOf('h2-orig').original_title, '首条用户提问用来做原始标题');
+      up('h2-orig', [...msg('首条用户提问用来做原始标题'), { role: 'assistant', content: 'AI 回答' }], { title: '第二次标题' });
+      assert.equal(rowOf('h2-orig').original_title, '首条用户提问用来做原始标题');
+      store.updateConversationMeta(conv.id, { title: '第三次手动标题' });
+      assert.equal(rowOf('h2-orig').title, '第三次手动标题');
+      assert.equal(rowOf('h2-orig').original_title, '首条用户提问用来做原始标题');
+      up('h2-orig-long', msg('问题'), { originalTitle: '长'.repeat(400) });
+      assert.equal(rowOf('h2-orig-long').original_title.length, 300);
+    });
+
+    await t('2e stripped_blocks', '取 max：重新采集到更小统计不覆盖已有更大值', () => {
+      up('h2-strip', msg('剥离统计'), { strippedBlocks: 7 });
+      assert.equal(rowOf('h2-strip').stripped_blocks, 7);
+      up('h2-strip', [...msg('剥离统计'), { role: 'assistant', content: '答' }], { strippedBlocks: 3 });
+      assert.equal(rowOf('h2-strip').stripped_blocks, 7);
+      up('h2-strip', [...msg('剥离统计'), { role: 'assistant', content: '答' }], { strippedBlocks: 9 });
+      assert.equal(rowOf('h2-strip').stripped_blocks, 9);
+    });
+
+    const listProj = store.saveProject({ name: '列表事项', workspace: '/w/list' });
+    const c1 = up('h2-list-1', [{ role: 'user', content: '列表问题一\n第二行' }, { role: 'assistant', content: '回答' }], { workspace: '/w/list/a' });
+    const c2 = up('h2-list-2', msg('列表问题二'), { workspace: '/w/list/b' });
+    up('h2-list-3', msg('无关会话'), { workspace: '/w/other' });
+
+    await t('2e list', 'projectId 过滤 + 返回全部字段（含 first_prompt 单行预览）', () => {
+      const rows = store.listConversations({ projectId: listProj.id, limit: 100 });
+      assert.deepEqual(rows.map((r) => r.id).sort(), [c1.id, c2.id].sort());
+      const fields = ['id', 'source', 'title', 'original_title', 'url', 'workspace', 'created_at', 'updated_at', 'message_count',
+        'ingest_method', 'project_id', 'summary', 'decisions_json', 'next_step', 'stripped_blocks', 'first_prompt'];
+      for (const k of fields) assert.ok(k in rows[0], `缺少字段 ${k}`);
+      const r1 = rows.find((r) => r.id === c1.id);
+      assert.equal(r1.project_id, listProj.id);
+      assert.equal(r1.first_prompt, '列表问题一 第二行');
+      assert.ok(!r1.first_prompt.includes('\n'), 'first_prompt 应为单行预览');
+      assert.equal(rows.find((r) => r.id === c2.id).first_prompt, '列表问题二');
+    });
+
+    await t('2e meta', 'updateConversationMeta 支持 summary/decisions/nextStep 并返回最新行；关联事项时刷新 updated_at', () => {
+      const before = store.getProject(listProj.id).updatedAt;
+      const meta = store.updateConversationMeta(c1.id, { projectId: listProj.id, summary: '一句话摘要', decisions: ['结论一', '结论二'], nextStep: '下一步做缓存压测' });
+      assert.equal(meta.id, c1.id);
+      assert.equal(meta.summary, '一句话摘要');
+      assert.deepEqual(meta.decisions, ['结论一', '结论二']);
+      assert.equal(meta.next_step, '下一步做缓存压测');
+      assert.ok(store.getProject(listProj.id).updatedAt >= before);
+      assert.equal(store.updateConversationMeta('nope', { title: 'x' }), null);
+    });
+
+    await t('2e stats', '原字段保留，新增 strippedBlocksTotal / strippedBlocksWeek', () => {
+      const st = store.stats();
+      for (const k of ['total', 'messages', 'today', 'todayMessages', 'bySource', 'messagesBySource', 'todayBySource']) assert.ok(k in st, `缺少原字段 ${k}`);
+      const sumAll = store.db.prepare('SELECT COALESCE(SUM(stripped_blocks), 0) AS n FROM conversations').get().n;
+      const sumWeek = store.db.prepare('SELECT COALESCE(SUM(stripped_blocks), 0) AS n FROM conversations WHERE updated_at >= ?')
+        .get(Date.now() - 7 * 86400_000).n;
+      assert.equal(st.strippedBlocksTotal, sumAll);
+      assert.equal(st.strippedBlocksWeek, sumWeek);
+      assert.ok(st.strippedBlocksTotal >= 9);
+      assert.ok(st.strippedBlocksWeek > 0);
+      assert.equal(st.total, store.db.prepare('SELECT COUNT(*) AS n FROM conversations').get().n);
+    });
+
+    await t('2e search', '标题/摘要/拍板/下一步/事项名命中（正文不命中）也返回，hits 为空且结构不变', () => {
+      const sp = store.saveProject({ name: '缓存雪崩专项', workspace: '/w/cache' });
+      const s1 = up('h2-search-1', msg('完全无关的正文内容'), { title: '缓存雪崩复盘' });
+      const s2 = up('h2-search-2', msg('另一段无关正文'));
+      store.updateConversationMeta(s2.id, { summary: '缓存雪崩与限流摘要' });
+      const s3 = up('h2-search-3', msg('第三段无关正文'));
+      store.db.prepare('UPDATE conversations SET project_id = ? WHERE id = ?').run(sp.id, s3.id);
+      const s4 = up('h2-search-4', msg('第四段无关正文'));
+      store.updateConversationMeta(s4.id, { decisions: ['决定采用本地缓存'], nextStep: '补齐缓存压测' });
+
+      const res = store.search('缓存雪崩');
+      const ids = res.map((r) => r.conversationId);
+      for (const id of [s1.id, s2.id, s3.id]) assert.ok(ids.includes(id), `应命中 ${id}`);
+      for (const r of res) {
+        assert.deepEqual(Object.keys(r).sort(), ['conversationId', 'hits', 'source', 'title', 'updatedAt', 'url']);
+        if ([s1.id, s2.id, s3.id].includes(r.conversationId)) assert.deepEqual(r.hits, []);
+      }
+      assert.ok(store.search('本地缓存').some((r) => r.conversationId === s4.id), '拍板结论命中');
+      assert.ok(store.search('缓存压测').some((r) => r.conversationId === s4.id), '下一步命中');
+      assert.equal(store.search('缓存雪崩', { limit: 1 }).length, 1);
+
+      // 正文命中时结构、hits 行为保持不变
+      const body = store.search('无关的正文');
+      assert.ok(body.length >= 1);
+      assert.deepEqual(Object.keys(body[0]).sort(), ['conversationId', 'hits', 'source', 'title', 'updatedAt', 'url']);
+      assert.ok(body[0].hits.length > 0);
+    });
+
+    store.close();
+  }
+
+  // =====================================================================
+  // 2f. H3：记忆包导出/导入（SPEC 2.2 第 4 点）
+  // =====================================================================
+  {
+    const PACK_VERSION = 'mem0-memory-pack-v1';
+    const buildSource = () => {
+      const s = freshStore();
+      const m1 = s.saveMemory({ group: '个人与职业背景', title: '背景卡', body: '十年后端', tags: ['画像'], sourceIds: ['c1'] });
+      const m2 = s.saveMemory({ group: '踩坑与经验库', title: 'Zstd 多帧坑', body: '只读到第一帧', tags: ['采集', 'Zstd'] });
+      const p1 = s.saveProject({ name: 'v0.6.0 升级', state: '推进中', workspace: 'D:\\work\\mem0', progress: '写迁移', decisions: ['用 FTS5'], rejected: ['Elasticsearch'], nextStep: '补测试' });
+      const p2 = s.saveProject({ name: '已结项事项', state: '已完成', archived: true, progress: 'done' });
+      return { s, m1, m2, p1, p2 };
+    };
+
+    await t('2f 记忆包', 'exportMemoryPack：版本/ISO 时间，memories 与 projects 均为 JS 数组', () => {
+      const { s } = buildSource();
+      const pack = s.exportMemoryPack();
+      assert.equal(pack.version, PACK_VERSION);
+      assert.ok(typeof pack.exportedAt === 'string' && !Number.isNaN(Date.parse(pack.exportedAt)), 'exportedAt 应为 ISO 时间');
+      assert.ok(Array.isArray(pack.memories));
+      assert.ok(Array.isArray(pack.projects));
+      assert.deepEqual(pack.memories, s.listMemories());
+      assert.deepEqual(pack.projects, s.listProjects({ includeArchived: true }));
+      const round = JSON.parse(JSON.stringify(pack));
+      assert.ok(Array.isArray(round.memories) && Array.isArray(round.projects), 'JSON 往返后仍为数组');
+      s.close();
+    });
+
+    await t('2f 记忆包', '导出→新库导入一致：卡片 / 事项（含归档）/ 时间戳全部保留', () => {
+      const { s: src } = buildSource();
+      const pack = src.exportMemoryPack();
+      const dst = freshStore();
+      const res = dst.importMemoryPack(pack);
+      assert.deepEqual(dst.listMemories(), src.listMemories());
+      assert.deepEqual(dst.listProjects({ includeArchived: true }), src.listProjects({ includeArchived: true }));
+      assert.equal(res.importedMemories, pack.memories.length);
+      assert.equal(res.importedProjects, pack.projects.length);
+      src.close(); dst.close();
+    });
+
+    await t('2f 记忆包', '重复导入幂等：行数不增加、内容不变、计数为 0', () => {
+      const { s: src } = buildSource();
+      const pack = src.exportMemoryPack();
+      const dst = freshStore();
+      const first = dst.importMemoryPack(pack);
+      assert.ok(first.importedMemories > 0 && first.importedProjects > 0);
+      const memRows = dst.db.prepare('SELECT COUNT(*) n FROM memories').get().n;
+      const projRows = dst.db.prepare('SELECT COUNT(*) n FROM projects').get().n;
+      const memSnap = dst.listMemories();
+      const projSnap = dst.listProjects({ includeArchived: true });
+      const second = dst.importMemoryPack(pack);
+      assert.deepEqual(second, { importedMemories: 0, importedProjects: 0 });
+      assert.equal(dst.db.prepare('SELECT COUNT(*) n FROM memories').get().n, memRows);
+      assert.equal(dst.db.prepare('SELECT COUNT(*) n FROM projects').get().n, projRows);
+      assert.deepEqual(dst.listMemories(), memSnap);
+      assert.deepEqual(dst.listProjects({ includeArchived: true }), projSnap);
+      src.close(); dst.close();
+    });
+
+    await t('2f 记忆包', '项目合并：按 id 再按同名匹配，decisions/rejected 去重，非更新不覆盖字段', () => {
+      const dst = freshStore();
+      const local = dst.saveProject({
+        id: 'p-merge', name: '订单服务改造', state: '推进中', workspace: '/old', progress: '旧进展',
+        decisions: ['a', 'b'], rejected: ['x'], nextStep: '旧下一步',
+      });
+      const older = local.updatedAt - 10000;
+      const res = dst.importMemoryPack({
+        version: PACK_VERSION,
+        projects: [
+          { id: 'p-merge', name: '订单服务改造', state: '待验证', workspace: '/new', progress: '新进展', nextStep: '新下一步', decisions: ['b', 'c'], rejected: ['x', 'y'], archived: false, updatedAt: older },
+          { id: 'p-different', name: '订单服务改造', state: '已完成', progress: '同名匹配不新建', decisions: ['z'], rejected: [], archived: true, updatedAt: older },
+          { id: 'p-different-2', name: '订单服务改造', state: '已完成', progress: '同名匹配不新建', decisions: ['z'], rejected: [], archived: true, updatedAt: older },
+        ],
+        memories: [],
+      });
+      assert.equal(dst.db.prepare('SELECT COUNT(*) n FROM projects').get().n, 1, '同名事项应合并而非新建');
+      const merged = dst.getProject('p-merge');
+      assert.deepEqual(merged.decisions, ['a', 'b', 'c', 'z']);
+      assert.deepEqual(merged.rejected, ['x', 'y']);
+      assert.equal(merged.state, '推进中', '导入项更旧时非空字段不覆盖');
+      assert.equal(merged.workspace, '/old');
+      assert.equal(merged.progress, '旧进展');
+      assert.equal(merged.nextStep, '旧下一步');
+      assert.equal(merged.archived, false);
+      assert.equal(res.importedProjects, 2, '仅前两条产生合并写库');
+      dst.close();
+    });
+
+    await t('2f 记忆包', '项目更新：导入项 updatedAt 更新时覆盖非空 state/progress/next/workspace/archived', () => {
+      const dst = freshStore();
+      const local = dst.saveProject({
+        id: 'p-up', name: '升级事项', state: '推进中', workspace: '/old', progress: '旧进展',
+        decisions: ['keep'], rejected: ['rkeep'], nextStep: '旧下一步',
+      });
+      const newer = local.updatedAt + 5000;
+      const first = dst.importMemoryPack({
+        version: PACK_VERSION,
+        projects: [{ id: 'p-up', name: '升级事项（改名）', state: '待验证', workspace: '/new', progress: '新进展', nextStep: '新下一步', decisions: ['keep', 'add'], rejected: ['rkeep', 'radd'], archived: true, updatedAt: newer }],
+        memories: [],
+      });
+      const p = dst.getProject('p-up');
+      assert.equal(p.name, '升级事项（改名）');
+      assert.equal(p.state, '待验证');
+      assert.equal(p.workspace, '/new');
+      assert.equal(p.progress, '新进展');
+      assert.equal(p.nextStep, '新下一步');
+      assert.equal(p.archived, true);
+      assert.deepEqual(p.decisions, ['keep', 'add']);
+      assert.deepEqual(p.rejected, ['rkeep', 'radd']);
+      assert.equal(first.importedProjects, 1);
+      // 再次导入更新但字段留空：非空字段不被空值清掉，archived 按布尔覆盖
+      dst.importMemoryPack({
+        version: PACK_VERSION,
+        projects: [{ id: 'p-up', name: '升级事项（改名）', state: '', workspace: '', progress: '', nextStep: '', decisions: [], rejected: [], archived: false, updatedAt: newer + 5000 }],
+        memories: [],
+      });
+      const p2 = dst.getProject('p-up');
+      assert.equal(p2.state, '待验证', '空 state 不清空');
+      assert.equal(p2.workspace, '/new', '空 workspace 不清空');
+      assert.equal(p2.progress, '新进展');
+      assert.equal(p2.nextStep, '新下一步');
+      assert.equal(p2.archived, false, 'archived 为布尔，更新时覆盖');
+      dst.close();
+    });
+
+    await t('2f 记忆包', '记忆卡：id / group+title 匹配，新卡插分组末尾，更新时原 body 记入 superseded', () => {
+      const dst = freshStore();
+      const byId = dst.saveMemory({ id: 'mem-id', group: '踩坑与经验库', title: '旧卡', body: '旧正文', tags: ['t1'] });
+      dst.saveMemory({ group: '踩坑与经验库', title: '同名卡', body: '同名旧正文', tags: ['t2'] });
+      dst.saveMemory({ group: '个人与职业背景', title: '背景卡', body: '背景正文' });
+      const base = Date.now() + 100000;
+      const res = dst.importMemoryPack({
+        version: PACK_VERSION,
+        memories: [
+          { id: 'mem-id', group: '踩坑与经验库', title: '旧卡', body: '新正文', tags: ['t1', 't9'], updatedAt: base },
+          { id: 'other-id', group: '踩坑与经验库', title: '同名卡', body: '同名新正文', tags: ['t3'], updatedAt: base },
+          { group: '踩坑与经验库', title: '新卡A', body: 'A', tags: [], updatedAt: base },
+          { group: '踩坑与经验库', title: '新卡B', body: 'B', tags: [], updatedAt: base },
+        ],
+        projects: [],
+      });
+      const byTitle = (x) => dst.listMemories().find((m) => m.title === x);
+      assert.equal(byTitle('旧卡').id, byId.id, '按 id 命中应更新原卡而非新建');
+      assert.equal(byTitle('旧卡').body, '新正文');
+      assert.equal(byTitle('旧卡').superseded, '旧正文');
+      assert.deepEqual(byTitle('旧卡').tags, ['t1', 't9']);
+      assert.equal(byTitle('同名卡').body, '同名新正文');
+      assert.equal(byTitle('同名卡').superseded, '同名旧正文');
+      assert.deepEqual(dst.listMemories({ group: '踩坑与经验库' }).map((m) => m.title), ['旧卡', '同名卡', '新卡A', '新卡B'], '新卡插分组末尾');
+      assert.deepEqual(dst.listMemories({ group: '个人与职业背景' }).map((m) => m.title), ['背景卡'], '未导入分组保持原样');
+      assert.equal(res.importedMemories, 4);
+      // 导入项更旧：不覆盖
+      dst.importMemoryPack({ version: PACK_VERSION, memories: [{ id: 'mem-id', group: '踩坑与经验库', title: '旧卡', body: '过期正文', tags: ['stale'], updatedAt: 1 }], projects: [] });
+      assert.equal(byTitle('旧卡').body, '新正文');
+      assert.equal(byTitle('旧卡').superseded, '旧正文');
+      // 导入项更新但 body 相同：不更新、不重写 superseded
+      const same = dst.importMemoryPack({ version: PACK_VERSION, memories: [{ id: 'mem-id', group: '踩坑与经验库', title: '旧卡', body: '新正文', tags: ['changed'], updatedAt: base + 5000 }], projects: [] });
+      assert.equal(same.importedMemories, 0, 'body 相同不更新');
+      assert.deepEqual(byTitle('旧卡').tags, ['t1', 't9']);
+      assert.equal(byTitle('旧卡').superseded, '旧正文');
+      dst.close();
+    });
+
+    await t('2f 记忆包', '非法版本/结构抛明确错误；非法分组与非法条目一律跳过', () => {
+      const dst = freshStore();
+      for (const bad of [null, undefined, {}, { version: 'mem0-memory-pack-v2' }, { version: 'x' }]) {
+        assert.throws(() => dst.importMemoryPack(bad), /mem0-memory-pack-v1/);
+      }
+      const existing = dst.saveMemory({ group: '协作与沟通准则', title: '已存在卡', body: '原正文' });
+      const res = dst.importMemoryPack({
+        version: PACK_VERSION,
+        memories: [
+          { id: existing.id, group: '非法分组', title: '已存在卡', body: '非法分组不应更新', updatedAt: existing.updatedAt + 99999 },
+          { group: '非法分组', title: '不应入库', body: 'x' },
+          { group: '个人与职业背景', title: '应入库', body: 'y' },
+          { group: '踩坑与经验库', title: '   ', body: '空标题跳过' },
+          null, 'x',
+        ],
+        projects: [null, { name: '  ' }],
+      });
+      assert.equal(dst.getMemory(existing.id).body, '原正文', '非法分组即使 id 命中也不更新');
+      assert.deepEqual(dst.listMemories().map((m) => m.title).sort(), ['已存在卡', '应入库'].sort());
+      assert.deepEqual(dst.listProjects({ includeArchived: true }), []);
+      assert.equal(res.importedMemories, 1);
+      assert.equal(res.importedProjects, 0);
+      dst.close();
+    });
+  }
+
+  // =====================================================================
+  // 2g. I1 AI organizer 基础：预设 / URL / 网络 / 密钥 / 脱敏 / 截断（SPEC 3.1-3.4）
+  // =====================================================================
+  {
+    const {
+      AI_PRESETS, AI_KEY_KV, resolveChatCompletionsUrl, redactSecretsForLLM,
+      prepareTranscriptForLLM, AiOrganizer,
+    } = require(path.join(ROOT, 'src/main/ai-organizer'));
+
+    await t('2g AI 预设', '4 个内置预设与 SPEC 3.1 完全一致', () => {
+      assert.deepEqual(AI_PRESETS, [
+        { id: 'deepseek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat', needKey: true },
+        { id: 'gemini', label: 'Gemini Flash', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash', needKey: true },
+        { id: 'openai', label: 'OpenAI 兼容 / 中转', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', needKey: true },
+        { id: 'ollama', label: '本地 Ollama（免 Key）', baseUrl: 'http://127.0.0.1:11434/v1', model: 'qwen2.5:7b', needKey: false },
+      ]);
+    });
+
+    await t('2g URL', 'resolveChatCompletionsUrl：裸 origin 补 /v1，已有路径补 /chat/completions，已完整不重复', () => {
+      const cases = [
+        ['https://api.deepseek.com', 'https://api.deepseek.com/v1/chat/completions'],
+        [' https://api.deepseek.com/ ', 'https://api.deepseek.com/v1/chat/completions'],
+        ['https://api.deepseek.com/v1/', 'https://api.deepseek.com/v1/chat/completions'],
+        ['https://generativelanguage.googleapis.com/v1beta/openai', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'],
+        ['https://api.openai.com/v1/chat/completions', 'https://api.openai.com/v1/chat/completions'],
+        ['https://api.openai.com/v1/chat/completions/', 'https://api.openai.com/v1/chat/completions'],
+        ['http://127.0.0.1:11434', 'http://127.0.0.1:11434/v1/chat/completions'],
+        ['http://127.0.0.1:11434/v1', 'http://127.0.0.1:11434/v1/chat/completions'],
+        ['', ''],
+      ];
+      for (const [input, expected] of cases) assert.equal(resolveChatCompletionsUrl(input), expected, input);
+    });
+
+    await t('2g 脱敏', 'redactSecretsForLLM 覆盖 sk-/AIza/ghp_/github_pat_/AKIA/xox/Bearer/私钥块且幂等', () => {
+      const privateKey = '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0123456789\n-----END RSA PRIVATE KEY-----';
+      const raw = [
+        'key sk-abcdefghijklmnop1234 end',
+        'google AIzaSyA1234567890abcdefghijklmnopqrstu end',
+        'github ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 end',
+        'fine github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 end',
+        'aws AKIAIOSFODNN7EXAMPLE end',
+        // 运行时拼接，避免假令牌字面量触发 GitHub 推送保护
+        `slack ${['xoxb', '123456789012', 'abcdefghijklmnop'].join('-')} end`,
+        'auth Bearer abcdefghijklmnopqrstuvwxyz.0123456789 end',
+        privateKey,
+        '普通正文保持不变',
+      ].join('\n');
+      const out = redactSecretsForLLM(raw);
+      assert.match(out, /\[REDACTED_KEY\]/);
+      assert.match(out, /\[REDACTED_TOKEN\]/);
+      assert.match(out, /\[REDACTED_PRIVATE_KEY\]/);
+      for (const secret of ['sk-abcdefghijklmnop1234', 'AIzaSyA1234567890abcdefghijklmnopqrstu', 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 'github_pat_11ABCDEFG0123456789_', 'AKIAIOSFODNN7EXAMPLE', 'xoxb-123456789012', 'Bearer abcdefghijklmnopqrstuvwxyz']) {
+        assert.ok(!out.includes(secret), `未脱敏: ${secret}`);
+      }
+      assert.match(out, /普通正文保持不变/);
+      assert.equal(redactSecretsForLLM(out), out, '脱敏应幂等');
+    });
+
+    await t('2g 脱敏', '本地 messages 原文不因脱敏/截断而改变', () => {
+      const store = freshStore();
+      const raw = '我的 Key 是 sk-abcdefghijklmnop1234，请勿外传。';
+      const { id } = store.upsertConversation({
+        source: 'claude-code',
+        externalId: 'ai-redact-1',
+        ingestMethod: 'local',
+        messages: [
+          { role: 'user', content: raw },
+          { role: 'assistant', content: '收到，已记录。' },
+        ],
+      });
+      const rows = () => msgs(store, id).map((m) => `${m.role}:${m.content}`);
+      const before = rows();
+      const out = prepareTranscriptForLLM(msgs(store, id).map((m) => ({ role: m.role, content: m.content })));
+      assert.match(out, /\[REDACTED_KEY\]/);
+      assert.ok(!out.includes('sk-abcdefghijklmnop1234'));
+      assert.deepEqual(rows(), before);
+      assert.equal(store.db.prepare('SELECT content FROM messages WHERE conversation_id = ? ORDER BY seq LIMIT 1').get(id).content, raw);
+      store.close();
+    });
+
+    await t('2g 截断', 'prepareTranscriptForLLM：12000 边界原样/截断，4500 头 + 提示 + 7000 尾且严格 <= maxChars', () => {
+      const prefix = '[用户] ';
+      const exactContent = 'x'.repeat(12000 - prefix.length);
+      const exact = prepareTranscriptForLLM([{ role: 'user', content: exactContent }]);
+      assert.equal(exact.length, 12000);
+      assert.doesNotMatch(exact, /中间省略/);
+
+      const longContent = '头'.repeat(4500) + '中'.repeat(20000) + '尾'.repeat(7000);
+      const out = prepareTranscriptForLLM([{ role: 'user', content: longContent }]);
+      assert.ok(out.length <= 12000, `实际 ${out.length}`);
+      const fullText = prefix + longContent;
+      assert.ok(out.startsWith(fullText.slice(0, 4500)));
+      assert.ok(out.endsWith('尾'.repeat(7000)));
+      assert.match(out, /中间省略 \d+ 字/);
+      assert.ok(out.length < exact.length);
+
+      const overContent = 'x'.repeat(12000 - prefix.length + 1);
+      const over = prepareTranscriptForLLM([{ role: 'user', content: overContent }]);
+      assert.ok(over.length <= 12000);
+      assert.match(over, /中间省略 501 字/);
+
+      const tiny = prepareTranscriptForLLM([{ role: 'user', content: 'y'.repeat(5000) }], 1000);
+      assert.ok(tiny.length <= 1000);
+      assert.ok(tiny.startsWith(prefix));
+    });
+
+    await t('2g 密钥', 'apiKey 落盘不是明文（纯 Node 用 b64:），getPublicState 无 apiKey 且 keyHint 掩码', () => {
+      const store = freshStore();
+      const key = 'sk-1234567890abcdef';
+      const org = new AiOrganizer({ store });
+      const state = org.saveConfig({ provider: 'deepseek', enabled: true, apiKey: key });
+      for (const row of store.db.prepare('SELECT k, v FROM kv').all()) {
+        assert.ok(!String(row.v).includes(key), `${row.k} 不得明文保存 Key`);
+      }
+      assert.match(store.getKv(AI_KEY_KV), /^b64:/);
+      assert.ok(!('apiKey' in state));
+      assert.ok(!JSON.stringify(state).includes(key));
+      assert.equal(state.hasKey, true);
+      assert.match(state.keyHint, /••••/);
+      assert.ok(!state.keyHint.includes(key));
+      assert.ok(state.keyHint.endsWith('cdef'));
+
+      const org2 = new AiOrganizer({ store });
+      assert.equal(org2.getPublicState().hasKey, true);
+      assert.equal(org2.getApiKey(), key);
+      store.close();
+    });
+
+    await t('2g 密钥', 'safeStorage 可用时以 enc: 加密落盘，读取解密且公开状态不含明文', () => {
+      const store = freshStore();
+      const electron = {
+        safeStorage: {
+          isEncryptionAvailable: () => true,
+          encryptString: (s) => Buffer.from(`enc:${s}`, 'utf8'),
+          decryptString: (b) => Buffer.from(b).toString('utf8').replace(/^enc:/, ''),
+        },
+      };
+      const key = 'sk-encrypted-987654';
+      const org = new AiOrganizer({ store, electron });
+      org.saveConfig({ apiKey: key, enabled: true });
+      assert.match(store.getKv(AI_KEY_KV), /^enc:/);
+      assert.equal(org.getApiKey(), key);
+      assert.equal(org.getPublicState().hasKey, true);
+      assert.ok(!JSON.stringify(org.getPublicState()).includes(key));
+      store.close();
+    });
+
+    await t('2g 状态', 'getPublicState 字段与 SPEC 3.3 一致，默认 deepseek/未配置，配置可跨实例恢复', () => {
+      const store = freshStore();
+      const org = new AiOrganizer({ store });
+      const s = org.getPublicState();
+      assert.deepEqual(Object.keys(s), [
+        'enabled', 'provider', 'baseUrl', 'model', 'hasKey', 'keyHint',
+        'statusText', 'statusOk', 'unorganizedCount', 'organizing',
+      ]);
+      assert.equal(s.enabled, false);
+      assert.equal(s.provider, 'deepseek');
+      assert.equal(s.baseUrl, 'https://api.deepseek.com/v1');
+      assert.equal(s.model, 'deepseek-chat');
+      assert.equal(s.hasKey, false);
+      assert.equal(s.keyHint, '');
+      assert.equal(s.statusText, '未配置');
+      assert.equal(s.statusOk, false);
+      assert.equal(s.unorganizedCount, 0);
+      assert.equal(s.organizing, false);
+
+      const key = 'AIzaSyA1234567890abcdefghijklmnopqrstu';
+      org.saveConfig({ enabled: true, provider: 'gemini', apiKey: key });
+      assert.equal(org.getPublicState().provider, 'gemini');
+      assert.equal(org.getPublicState().baseUrl, 'https://generativelanguage.googleapis.com/v1beta/openai');
+      assert.equal(org.getPublicState().model, 'gemini-2.5-flash');
+      assert.equal(org.getPublicState().statusText, '已就绪');
+
+      const org2 = new AiOrganizer({ store });
+      assert.equal(org2.getPublicState().provider, 'gemini');
+      assert.equal(org2.getPublicState().hasKey, true);
+      assert.equal(org2.getApiKey(), key);
+      store.close();
+    });
+
+    const seen = [];
+    const mock = await new Promise((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+          let parsed = null;
+          try { parsed = JSON.parse(body); } catch { parsed = null; }
+          seen.push({ method: req.method, url: req.url, headers: req.headers, body: parsed });
+          const headers = { 'Content-Type': 'application/json', Connection: 'close' };
+          if (req.headers.authorization === 'Bearer bad-key-123456') {
+            res.writeHead(401, headers);
+            res.end(JSON.stringify({ error: { message: 'invalid api key' } }));
+            return;
+          }
+          res.writeHead(200, headers);
+          res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'OK' } }] }));
+        });
+      });
+      server.on('error', reject);
+      server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }));
+    });
+    const mockBase = `http://127.0.0.1:${mock.port}/v1`;
+
+    await t('2g 网络', 'testConfig 本地 Mock 成功：ok/latencyMs、Bearer 头、Content-Type 与 POST 路径正确', async () => {
+      const store = freshStore();
+      const org = new AiOrganizer({ store });
+      const r = await org.testConfig({ provider: 'openai', baseUrl: mockBase, model: 'mock-model', apiKey: 'good-key-123456', enabled: true });
+      assert.equal(r.ok, true);
+      assert.equal(r.error, undefined);
+      assert.ok(Number.isFinite(r.latencyMs) && r.latencyMs >= 0);
+      const req = seen[seen.length - 1];
+      assert.equal(req.method, 'POST');
+      assert.equal(req.url, '/v1/chat/completions');
+      assert.equal(req.headers.authorization, 'Bearer good-key-123456');
+      assert.match(req.headers['content-type'], /^application\/json/);
+      assert.equal(req.body.model, 'mock-model');
+      assert.ok(Array.isArray(req.body.messages) && req.body.messages.length === 1);
+      assert.equal(org.getPublicState().statusOk, true);
+      assert.match(org.getPublicState().statusText, /^连接正常 · \d+ms$/);
+      store.close();
+    });
+
+    await t('2g 网络', 'testConfig 对 Mock 401 返回 ok=false、error 含 401，状态置错', async () => {
+      const store = freshStore();
+      const org = new AiOrganizer({ store });
+      const r = await org.testConfig({ provider: 'openai', baseUrl: mockBase, model: 'm', apiKey: 'bad-key-123456', enabled: true });
+      assert.equal(r.ok, false);
+      assert.match(r.error, /401/);
+      assert.ok(Number.isFinite(r.latencyMs) && r.latencyMs >= 0);
+      assert.equal(org.getPublicState().statusOk, false);
+      assert.match(org.getPublicState().statusText, /401/);
+      assert.equal(org.getPublicState().hasKey, true);
+      store.close();
+    });
+
+    await t('2g 密钥', '掩码/空 Key 自动复用旧 Key，clearKey 清空且请求不再带 Authorization', async () => {
+      const store = freshStore();
+      const org = new AiOrganizer({ store });
+      org.saveConfig({ provider: 'openai', baseUrl: mockBase, model: 'm', apiKey: 'reuse-key-123456', enabled: true });
+      await org.testConfig({ apiKey: 'sk-••••3456' });
+      assert.equal(seen[seen.length - 1].headers.authorization, 'Bearer reuse-key-123456');
+      await org.testConfig({ apiKey: '' });
+      assert.equal(seen[seen.length - 1].headers.authorization, 'Bearer reuse-key-123456');
+      await org.testConfig({});
+      assert.equal(seen[seen.length - 1].headers.authorization, 'Bearer reuse-key-123456');
+
+      const cleared = org.saveConfig({ clearKey: true });
+      assert.equal(cleared.hasKey, false);
+      assert.equal(cleared.keyHint, '');
+      await org.testConfig({});
+      assert.equal(seen[seen.length - 1].headers.authorization, undefined);
+      store.close();
+    });
+
+    await t('2g 网络', '回环走 globalThis.fetch（忽略 electron.net.fetch）；公网优先 electron.net.fetch；fetchImpl 最高优先', async () => {
+      const store1 = freshStore();
+      const throwingElectron = { net: { fetch: async () => { throw new Error('不应使用 electron.net.fetch'); } } };
+      const org = new AiOrganizer({ store: store1, electron: throwingElectron });
+      org.saveConfig({ provider: 'openai', baseUrl: mockBase, model: 'm', apiKey: 'loop-key-123456' });
+      assert.equal(await org.callChat([{ role: 'user', content: 'ping' }]), 'OK');
+
+      const store2 = freshStore();
+      let netUrl = '';
+      const electron = {
+        net: {
+          fetch: async (url) => {
+            netUrl = url;
+            return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'NET' } }] }) };
+          },
+        },
+      };
+      const publicOrg = new AiOrganizer({ store: store2, electron });
+      publicOrg.saveConfig({ provider: 'openai', baseUrl: 'https://example.com/v1', model: 'm' });
+      assert.equal(await publicOrg.callChat([{ role: 'user', content: 'ping' }]), 'NET');
+      assert.equal(netUrl, 'https://example.com/v1/chat/completions');
+
+      const store3 = freshStore();
+      let injected = 0;
+      const injectedOrg = new AiOrganizer({
+        store: store3,
+        electron,
+        fetchImpl: async () => {
+          injected++;
+          return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'STUB' } }] }) };
+        },
+      });
+      injectedOrg.saveConfig({ provider: 'openai', baseUrl: mockBase, model: 'm' });
+      assert.equal(await injectedOrg.callChat([{ role: 'user', content: 'ping' }]), 'STUB');
+      assert.equal(injected, 1);
+
+      store1.close();
+      store2.close();
+      store3.close();
+    });
+
+    await new Promise((resolve) => {
+      mock.server.close(resolve);
+      if (typeof mock.server.closeAllConnections === 'function') mock.server.closeAllConnections();
+    });
+  }
+
+  // =====================================================================
+  // 2h. I2 AI 自动整理：双水位线 / 空闲防抖 / 写入红线 / 粘贴拆卡（SPEC 3.5-3.6）
+  // =====================================================================
+  {
+    const {
+      AiOrganizer, AI_ENABLE_WATERMARK_KV, NEW_PROJECT_TARGET,
+      parseOrganizerJson, splitPastedTextToDrafts,
+    } = require(path.join(ROOT, 'src/main/ai-organizer'));
+
+    const aiReply = (over = {}) => ({
+      shortTitle: '自动标题',
+      summary: '自动摘要',
+      decisions: ['自动结论'],
+      nextStep: '自动下一步',
+      projectMatch: { action: 'none' },
+      pitfallCard: null,
+      ...over,
+    });
+
+    const requests = [];
+    let responder = () => aiReply();
+    const mockServer = await new Promise((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+          let parsed = null;
+          try { parsed = JSON.parse(body); } catch { parsed = null; }
+          const item = { method: req.method, url: req.url, headers: req.headers, body: parsed, raw: body };
+          requests.push(item);
+          let out;
+          try { out = responder(parsed, item); } catch (e) { out = { __status: 500, __error: e.message }; }
+          const headers = { 'Content-Type': 'application/json', Connection: 'close' };
+          if (out && out.__status) {
+            res.writeHead(out.__status, headers);
+            res.end(JSON.stringify({ error: { message: out.__error || 'mock error' } }));
+            return;
+          }
+          const content = typeof out === 'string' ? out : JSON.stringify(out);
+          res.writeHead(200, headers);
+          res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content } }] }));
+        });
+      });
+      server.on('error', reject);
+      server.listen(0, '127.0.0.1', () => resolve(server));
+    });
+    const mockBase = `http://127.0.0.1:${mockServer.address().port}/v1`;
+    const makeOrg = (store, opts = {}) => new AiOrganizer({ store, idleMs: 100, checkIntervalMs: 10, ...opts });
+    const enable = (org) => org.saveConfig({
+      enabled: true, provider: 'openai', baseUrl: mockBase, model: 'mock-model', apiKey: 'test-key-1234567890',
+    });
+    const addConv = (store, externalId, contents, updatedAt) => store.upsertConversation({
+      source: 'claude-code',
+      externalId,
+      ingestMethod: 'local',
+      createdAt: updatedAt - 1000,
+      updatedAt,
+      messages: contents.map((content, i) => ({ role: i % 2 === 0 ? 'user' : 'assistant', content })),
+    });
+    const waitFor = async (fn, timeout = 2000) => {
+      const started = Date.now();
+      while (!fn()) {
+        if (Date.now() - started > timeout) throw new Error('等待超时');
+        await sleep(10);
+      }
+    };
+
+    await t('2h 拆卡', 'splitPastedTextToDrafts：空行/标题/列表项确定性切分，target 只允许合法值', () => {
+      const paragraphs = splitPastedTextToDrafts('第一段内容。\n\n第二段内容。', '协作与沟通准则');
+      assert.equal(paragraphs.length, 2);
+      assert.deepEqual(paragraphs.map((x) => x.title), ['第一段内容', '第二段内容']);
+      assert.deepEqual(paragraphs.map((x) => x.body), ['第一段内容。', '第二段内容。']);
+
+      const headings = splitPastedTextToDrafts('## 标题一\n正文一\n\n## 标题二\n正文二', '环境与工作流');
+      assert.deepEqual(headings.map((x) => x.title), ['标题一', '标题二']);
+      assert.deepEqual(headings.map((x) => x.body), ['正文一', '正文二']);
+
+      const list = splitPastedTextToDrafts('- 要点一：内容一\n- 要点二：内容二', '踩坑与经验库');
+      assert.deepEqual(list.map((x) => x.title), ['要点一', '要点二']);
+      assert.deepEqual(list.map((x) => x.body), ['内容一', '内容二']);
+
+      const project = splitPastedTextToDrafts('一段笔记', '__new_project__');
+      assert.equal(project[0].target, NEW_PROJECT_TARGET);
+      for (const d of [...paragraphs, ...headings, ...list, ...project]) {
+        assert.ok(MEMORY_GROUPS.includes(d.target) || d.target === NEW_PROJECT_TARGET, d.target);
+      }
+      assert.deepEqual(splitPastedTextToDrafts('   \n\n  ', '环境与工作流'), []);
+    });
+
+    await t('2h 拆卡', 'splitImportWithAI：未启用/无 Key/报错/非数组回退本地，合法数组归一化 target', async () => {
+      const store = freshStore();
+      const raw = '## 标题\n正文内容';
+      const local = splitPastedTextToDrafts(raw, '环境与工作流');
+      const org = makeOrg(store);
+      const n0 = requests.length;
+      assert.deepEqual(await org.splitImportWithAI(raw, '环境与工作流'), local);
+      assert.equal(requests.length, n0, '未启用不应请求');
+
+      org.saveConfig({ enabled: true, provider: 'openai', baseUrl: mockBase, model: 'm' });
+      assert.deepEqual(await org.splitImportWithAI(raw, '环境与工作流'), local, '无 Key 应回退');
+      assert.equal(requests.length, n0, '无 Key 不应请求');
+
+      org.saveConfig({ apiKey: 'test-key-1234567890' });
+      responder = () => ({ __status: 500, __error: 'boom' });
+      assert.deepEqual(await org.splitImportWithAI(raw, '环境与工作流'), local, '网络报错应回退');
+
+      responder = () => ({ ok: true, notArray: [] });
+      assert.deepEqual(await org.splitImportWithAI(raw, '环境与工作流'), local, '非数组应回退');
+
+      responder = () => '```json\n' + JSON.stringify([
+        { title: 'A', body: 'a', target: '非法分组' },
+        { title: 'B', body: 'b', target: NEW_PROJECT_TARGET },
+        { title: '', body: '', target: '环境与工作流' },
+      ]) + '\n```';
+      const out = await org.splitImportWithAI(raw, '踩坑与经验库');
+      assert.deepEqual(out.map((x) => x.title), ['A', 'B']);
+      assert.equal(out[0].target, '踩坑与经验库');
+      assert.equal(out[1].target, NEW_PROJECT_TARGET);
+      store.close();
+    });
+
+    await t('2h 围栏', 'parseOrganizerJson 兼容 ```json 围栏与前后说明文字，非法文本返回 null', () => {
+      assert.deepEqual(parseOrganizerJson('```json\n{"a":1}\n```'), { a: 1 });
+      assert.deepEqual(parseOrganizerJson('说明\n```JSON\n[1,2]\n```\n结尾'), [1, 2]);
+      assert.deepEqual(parseOrganizerJson('前言 {"a":2} 后记'), { a: 2 });
+      assert.equal(parseOrganizerJson('这不是 JSON'), null);
+      assert.equal(parseOrganizerJson(''), null);
+    });
+
+    await t('2h 水位线', '旧会话只计入 unorganizedCount；organizeOldConversations 按 limit 串行且更新水位', async () => {
+      const store = freshStore();
+      const base = 1_700_000_000_000;
+      const ids = [];
+      for (let i = 0; i < 3; i++) ids.push(addConv(store, `old-${i}`, [`旧问题${i}`, `旧回答${i}`], base + i * 1000).id);
+      const now = base + 100_000;
+      const org = makeOrg(store, { now: () => now });
+      enable(org);
+      assert.equal(org.getPublicState().unorganizedCount, 3);
+      assert.equal(store.getKv(AI_ENABLE_WATERMARK_KV), String(now));
+
+      responder = () => aiReply({ shortTitle: '旧会话整理标题' });
+      const n0 = requests.length;
+      await org.checkNow();
+      assert.equal(requests.length, n0, '旧会话不能被定时器自动整理');
+      assert.equal(org.getPublicState().unorganizedCount, 3);
+
+      const first = await org.organizeOldConversations({ limit: 2 });
+      assert.deepEqual(first, { organized: 2, remaining: 1 });
+      assert.equal(requests.length, n0 + 2);
+      assert.equal(org.getPublicState().unorganizedCount, 1);
+
+      const second = await org.organizeOldConversations({ limit: 2 });
+      assert.deepEqual(second, { organized: 1, remaining: 0 });
+      for (const id of ids) {
+        const row = store.getConversation(id, { limit: 1 });
+        assert.equal(row.ai_msg_watermark, 2);
+        assert.equal(row.ai_organized_at, now);
+        assert.equal(row.summary, '自动摘要');
+      }
+      store.close();
+    });
+
+    await t('2h 水位线', 'organizeOldConversations 中途 enabled 关闭立即停止', async () => {
+      const store = freshStore();
+      const base = 1_700_000_050_000;
+      for (let i = 0; i < 3; i++) addConv(store, `stop-${i}`, [`问题${i}`, `回答${i}`], base + i * 1000);
+      const org = makeOrg(store, { now: () => base + 100_000 });
+      enable(org);
+      responder = () => {
+        org.saveConfig({ enabled: false });
+        return aiReply();
+      };
+      const n0 = requests.length;
+      const r = await org.organizeOldConversations({ limit: 3 });
+      assert.deepEqual(r, { organized: 1, remaining: 2 });
+      assert.equal(requests.length, n0 + 1);
+      assert.equal(org.getPublicState().enabled, false);
+      responder = () => aiReply();
+      store.close();
+    });
+
+    await t('2h 空闲防抖', '新会话空闲后仅请求 1 次；无新增不再请求；新增后再请求 1 次', async () => {
+      const store = freshStore();
+      let now = 1_700_000_100_000;
+      const org = makeOrg(store, { now: () => now, idleMs: 100, checkIntervalMs: 10 });
+      enable(org);
+      const conv = addConv(store, 'idle-new', ['新问题', '新回答'], now + 10);
+      responder = () => aiReply({ shortTitle: '空闲标题' });
+      const n0 = requests.length;
+
+      now += 50;
+      await org.checkNow();
+      assert.equal(requests.length, n0, '未满空闲阈值不应请求');
+
+      now += 100;
+      org.start();
+      try {
+        await waitFor(() => requests.length >= n0 + 1);
+      } finally {
+        org.stop();
+      }
+      assert.equal(requests.length, n0 + 1, '空闲后只请求 1 次');
+      let row = store.getConversation(conv.id, { limit: 1 });
+      assert.equal(row.title, '空闲标题');
+      assert.equal(row.ai_msg_watermark, 2);
+      assert.equal(row.ai_organized_at, now);
+
+      await org.checkNow();
+      assert.equal(requests.length, n0 + 1, '无新增消息不再请求');
+
+      const updatedAt = now - 10;
+      store.upsertConversation({
+        source: 'claude-code',
+        externalId: 'idle-new',
+        ingestMethod: 'local',
+        createdAt: updatedAt - 1000,
+        updatedAt,
+        messages: [
+          { role: 'user', content: '新问题' },
+          { role: 'assistant', content: '新回答' },
+          { role: 'user', content: '继续追问' },
+        ],
+      });
+      now += 100;
+      await org.checkNow();
+      assert.equal(requests.length, n0 + 2, '新增消息并再次空闲后只再请求 1 次');
+      row = store.getConversation(conv.id, { limit: 1 });
+      assert.equal(row.ai_msg_watermark, 3);
+      assert.equal(row.ai_organized_at, now);
+      store.close();
+    });
+
+    await t('2h 围栏/脱敏', 'organizeConversation 解析围栏 JSON；请求体脱敏而库内 messages 原文不变', async () => {
+      const store = freshStore();
+      const secret = 'sk-abcdefghijklmnop1234';
+      const raw = `我的密钥是 ${secret}，请勿外传。`;
+      const base = 1_700_000_200_000;
+      const conv = addConv(store, 'redact-conv', [raw, '收到，已记录。'], base);
+      const org = makeOrg(store, { now: () => base + 1000 });
+      enable(org);
+      responder = () => '```json\n' + JSON.stringify(aiReply({ shortTitle: '围栏标题', summary: '围栏摘要' })) + '\n```';
+      const n0 = requests.length;
+      const r = await org.organizeConversation(conv.id);
+      assert.ok(r);
+      const req = requests[n0];
+      assert.ok(req && req.raw);
+      assert.ok(!req.raw.includes(secret), '请求体不得包含明文密钥');
+      assert.match(req.raw, /\[REDACTED_KEY\]/);
+      const row = store.getConversation(conv.id, { limit: 5 });
+      assert.equal(row.title, '围栏标题');
+      assert.equal(row.summary, '围栏摘要');
+      assert.equal(row.ai_msg_watermark, 2);
+      assert.equal(store.db.prepare('SELECT content FROM messages WHERE conversation_id = ? ORDER BY seq LIMIT 1').get(conv.id).content, raw);
+      store.close();
+    });
+
+    await t('2h 解析失败', 'LLM 返回非 JSON 时不写任何字段、不推进水位、不改 messages', async () => {
+      const store = freshStore();
+      const base = 1_700_000_300_000;
+      const conv = addConv(store, 'bad-json', ['问题', '回答'], base);
+      const org = makeOrg(store, { now: () => base + 1000 });
+      enable(org);
+      const before = store.getConversation(conv.id, { limit: 5 });
+      const beforeMsgs = msgs(store, conv.id);
+      responder = () => '这不是 JSON，只是普通文本';
+      const r = await org.organizeConversation(conv.id);
+      assert.equal(r, null);
+      const after = store.getConversation(conv.id, { limit: 5 });
+      assert.equal(after.title, before.title);
+      assert.equal(after.summary, '');
+      assert.equal(after.decisions_json, '[]');
+      assert.equal(after.next_step, '');
+      assert.equal(after.project_id, before.project_id);
+      assert.equal(after.ai_organized_at, null);
+      assert.equal(after.ai_msg_watermark, 0);
+      assert.deepEqual(msgs(store, conv.id), beforeMsgs);
+      store.close();
+    });
+
+    await t('2h 红线', '锁定会话：标题/事项与事项字段均不变，其它分组卡片被硬拦截', async () => {
+      const store = freshStore();
+      const base = 1_700_000_400_000;
+      const proj = store.saveProject({ name: '锁定事项', state: '推进中', progress: '原进展', decisions: ['原结论'], rejected: ['原否决'], nextStep: '原下一步' });
+      const conv = addConv(store, 'locked-conv', ['锁定问题', '锁定回答'], base);
+      store.updateConversationMeta(conv.id, { title: '锁定标题', projectId: proj.id });
+      const beforeConv = store.getConversation(conv.id, { limit: 5 });
+      const beforeProj = store.getProject(proj.id);
+      const beforeMsgs = msgs(store, conv.id);
+      const org = makeOrg(store, { now: () => base + 1000 });
+      enable(org);
+      responder = () => aiReply({
+        shortTitle: '不应覆盖标题',
+        summary: '允许更新摘要',
+        decisions: ['允许更新结论'],
+        nextStep: '允许更新下一步',
+        projectMatch: { action: 'new', newProjectName: '不应新建事项', state: '已完成', progress: '不应改', addedDecisions: ['不应加'], addedRejected: ['不应加'], nextStep: '不应改' },
+        pitfallCard: { group: '个人与职业背景', title: '锁定会话踩坑', body: '根因与修复', tags: ['SQLite'] },
+        cards: [{ group: '协作与沟通准则', title: '非法卡', body: '不应写入' }],
+        memories: [{ group: '环境与工作流', title: '非法卡2', body: '不应写入' }],
+      });
+      const r = await org.organizeConversation(conv.id);
+      assert.ok(r);
+      const afterConv = store.getConversation(conv.id, { limit: 5 });
+      assert.equal(afterConv.title, '锁定标题');
+      assert.equal(afterConv.original_title, beforeConv.original_title);
+      assert.equal(afterConv.project_id, proj.id);
+      assert.equal(afterConv.title_locked, 1);
+      assert.equal(afterConv.project_locked, 1);
+      assert.equal(afterConv.summary, '允许更新摘要');
+      assert.equal(afterConv.ai_msg_watermark, 2);
+      assert.deepEqual(store.getProject(proj.id), beforeProj, '锁定事项字段不应被修改');
+      assert.equal(store.listProjects({ includeArchived: true }).length, 1, '不应新建事项');
+      assert.deepEqual(msgs(store, conv.id), beforeMsgs, 'messages 原文不得修改');
+      for (const group of ['个人与职业背景', '协作与沟通准则', '环境与工作流']) {
+        assert.equal(store.listMemories({ group }).length, 0, `${group} 必须 0 写入`);
+      }
+      const pits = store.listMemories({ group: '踩坑与经验库' });
+      assert.equal(pits.length, 1);
+      assert.equal(pits[0].title, '锁定会话踩坑');
+      assert.equal(pits[0].originLabel, 'AI 自动沉淀');
+      assert.deepEqual(pits[0].sourceIds, [conv.id]);
+      store.close();
+    });
+
+    await t('2h 红线', '未锁定会话：existing 事项合并去重、非法 id 忽略；踩坑卡同名合并且三画像分组 0 写入', async () => {
+      const store = freshStore();
+      const base = 1_700_000_500_000;
+      const proj = store.saveProject({ name: '合并事项', state: '推进中', progress: '旧进展', decisions: ['已拍板A'], rejected: ['已否决A'], nextStep: '旧下一步' });
+      const conv = addConv(store, 'merge-conv', ['排查 SQLite 报错', '根因是锁等待，已修复'], base);
+      const org = makeOrg(store, { now: () => base + 1000 });
+      enable(org);
+      responder = () => aiReply({
+        shortTitle: 'SQLite 锁等待',
+        summary: '锁等待导致报错',
+        projectMatch: {
+          action: 'existing', projectId: proj.id, state: '待验证', progress: '新进展',
+          addedDecisions: ['已拍板A', '已拍板B'], addedRejected: ['已否决A', '已否决B'], nextStep: '新下一步',
+        },
+        pitfallCard: { group: '个人与职业背景', title: 'SQLite 锁等待', body: '现象：报错；根因：长事务；修复：缩短事务。', tags: ['SQLite'] },
+        cards: [{ group: '协作与沟通准则', title: '非法卡', body: 'x' }],
+      });
+      const n0 = requests.length;
+      const r = await org.organizeConversation(conv.id);
+      assert.ok(r);
+      const after = store.getConversation(conv.id, { limit: 5 });
+      assert.equal(after.title, 'SQLite 锁等待');
+      assert.equal(after.original_title, '排查 SQLite 报错', 'AI 改标题前应保留 original_title');
+      assert.equal(after.title_locked, 0);
+      assert.equal(after.project_id, proj.id);
+      assert.equal(after.project_locked, 0);
+      const merged = store.getProject(proj.id);
+      assert.equal(merged.state, '待验证');
+      assert.equal(merged.progress, '新进展');
+      assert.equal(merged.nextStep, '新下一步');
+      assert.deepEqual(merged.decisions, ['已拍板A', '已拍板B']);
+      assert.deepEqual(merged.rejected, ['已否决A', '已否决B']);
+      assert.equal(store.listProjects({ includeArchived: true }).length, 1);
+
+      responder = () => aiReply({
+        shortTitle: 'SQLite 锁等待',
+        summary: '锁等待导致报错',
+        pitfallCard: { group: '环境与工作流', title: 'SQLite 锁等待', body: '现象：报错；根因：长事务；修复：缩短事务并重试。', tags: ['重试'] },
+      });
+      const conv2 = addConv(store, 'merge-conv-2', ['另一个 SQLite 报错', '同样根因'], base + 100);
+      const r2 = await org.organizeConversation(conv2.id);
+      assert.ok(r2);
+      const pits = store.listMemories({ group: '踩坑与经验库' });
+      assert.equal(pits.length, 1);
+      assert.match(pits[0].body, /重试/);
+      assert.match(pits[0].superseded, /缩短事务。/);
+      assert.deepEqual(pits[0].tags, ['SQLite', '重试']);
+      assert.deepEqual(pits[0].sourceIds, [conv.id, conv2.id]);
+      for (const group of ['个人与职业背景', '协作与沟通准则', '环境与工作流']) {
+        assert.equal(store.listMemories({ group }).length, 0, `${group} 必须 0 写入`);
+      }
+      assert.equal(requests.length, n0 + 2);
+
+      responder = () => aiReply({ projectMatch: { action: 'existing', projectId: 'missing-project-id' } });
+      const conv3 = addConv(store, 'bad-project-id', ['独立问答', '普通回答'], base + 200);
+      await org.organizeConversation(conv3.id);
+      assert.equal(store.getConversation(conv3.id, { limit: 1 }).project_id, null, '不存在的事项 id 不得写入');
+
+      responder = () => aiReply({ projectMatch: { action: 'new', newProjectName: '新事项', state: '推进中', addedDecisions: ['新结论'] } });
+      const conv4 = addConv(store, 'new-project', ['新项目讨论', '形成结论'], base + 300);
+      await org.organizeConversation(conv4.id);
+      const created = store.listProjects().find((x) => x.name === '新事项');
+      assert.ok(created, 'action=new 应创建事项');
+      assert.equal(store.getConversation(conv4.id, { limit: 1 }).project_id, created.id);
+      store.close();
+    });
+
+    await t('2i 摘要静默锁', '手动改摘要/决策/下一步后 summary_locked=1，AI 整理不覆写；标题等其它字段照常', async () => {
+      const store = freshStore();
+      const base = 1_700_000_500_000;
+      const conv = addConv(store, 'sum-locked', ['问题甲', '回答甲'], base);
+      assert.equal(Number(store.getConversation(conv.id, { limit: 1 }).summary_locked), 0, '新会话默认未锁');
+      const meta = store.updateConversationMeta(conv.id, { summary: '手动摘要', decisions: ['手动结论'], nextStep: '手动下一步' });
+      assert.equal(Number(meta.summary_locked), 1, '手动改摘要静默置锁');
+      const org = makeOrg(store, { now: () => base + 1000 });
+      enable(org);
+      responder = () => aiReply({ shortTitle: 'AI 标题', summary: 'AI 摘要', decisions: ['AI 结论'], nextStep: 'AI 下一步' });
+      const r = await org.organizeConversation(conv.id);
+      assert.ok(r);
+      const row = store.getConversation(conv.id, { limit: 1 });
+      assert.equal(row.summary, '手动摘要');
+      assert.equal(row.decisions_json, JSON.stringify(['手动结论']));
+      assert.equal(row.next_step, '手动下一步');
+      assert.equal(row.title, 'AI 标题', '摘要锁不影响未锁定的标题');
+      assert.equal(row.ai_msg_watermark, 2);
+      // db 层二次拦截：绕过 organizer 直接写也不得覆写
+      store.applyAiOrganization(conv.id, { summary: '直写摘要', decisions: ['直写'], nextStep: '直写下一步' });
+      const row2 = store.getConversation(conv.id, { limit: 1 });
+      assert.equal(row2.summary, '手动摘要');
+      assert.equal(row2.decisions_json, JSON.stringify(['手动结论']));
+      assert.equal(row2.next_step, '手动下一步');
+      // 只改标题/归属不置摘要锁
+      const conv2 = addConv(store, 'title-only', ['问题乙', '回答乙'], base + 10);
+      assert.equal(Number(store.updateConversationMeta(conv2.id, { title: '只改标题' }).summary_locked), 0);
+      store.close();
+    });
+
+    await t('2i 摘要续聊刷新', '未手动改摘要：续聊后再次整理正常刷新；模型给空摘要不清空已有摘要', async () => {
+      const store = freshStore();
+      const base = 1_700_000_600_000;
+      const conv = addConv(store, 'sum-refresh', ['问题丙', '回答丙'], base);
+      const org = makeOrg(store, { now: () => base + 1000 });
+      enable(org);
+      responder = () => aiReply({ summary: '第一版摘要' });
+      await org.organizeConversation(conv.id);
+      assert.equal(store.getConversation(conv.id, { limit: 1 }).summary, '第一版摘要');
+      addConv(store, 'sum-refresh', ['问题丙', '回答丙', '追问丙', '再答丙'], base + 50);
+      responder = () => aiReply({ summary: '第二版摘要', decisions: ['新结论'] });
+      await org.organizeConversation(conv.id);
+      let row = store.getConversation(conv.id, { limit: 1 });
+      assert.equal(row.summary, '第二版摘要');
+      assert.equal(row.decisions_json, JSON.stringify(['新结论']));
+      assert.equal(Number(row.summary_locked), 0);
+      assert.equal(row.ai_msg_watermark, 4);
+      responder = () => aiReply({ summary: '' });
+      await org.organizeConversation(conv.id);
+      row = store.getConversation(conv.id, { limit: 1 });
+      assert.equal(row.summary, '第二版摘要', '空摘要不得清空已有非空摘要');
+      store.applyAiOrganization(conv.id, { summary: '   ' });
+      assert.equal(store.getConversation(conv.id, { limit: 1 }).summary, '第二版摘要', 'db 层同样防清空');
+      const keptDecisions = store.getConversation(conv.id, { limit: 1 }).decisions_json;
+      assert.notEqual(keptDecisions, '[]');
+      responder = () => aiReply({ summary: '第三版摘要', decisions: [], nextStep: '' });
+      await org.organizeConversation(conv.id);
+      row = store.getConversation(conv.id, { limit: 1 });
+      assert.equal(row.decisions_json, keptDecisions, '空结论数组不得清空已有非空结论');
+      assert.equal(row.next_step, '', 'nextStep 允许置空（待办完成）');
+      store.applyAiOrganization(conv.id, { decisions: [] });
+      assert.equal(store.getConversation(conv.id, { limit: 1 }).decisions_json, keptDecisions, 'db 层同样防清空结论');
+      store.close();
+    });
+
+    await t('2i 水位竞态', '请求飞行期间新入库的消息不被提前计入 ai_msg_watermark', async () => {
+      const store = freshStore();
+      const base = 1_700_000_700_000;
+      const conv = addConv(store, 'wm-race', ['问题丁', '回答丁'], base);
+      const org = makeOrg(store, { now: () => base + 1000 });
+      enable(org);
+      let injected = false;
+      responder = () => {
+        if (!injected) {
+          injected = true;
+          addConv(store, 'wm-race', ['问题丁', '回答丁', '飞行中追问', '飞行中回答'], base + 500);
+        }
+        return aiReply({ summary: '竞态摘要' });
+      };
+      const r = await org.organizeConversation(conv.id);
+      assert.ok(r && injected);
+      const row = store.getConversation(conv.id, { limit: 1 });
+      assert.equal(row.message_count, 4, '飞行期间消息已入库');
+      assert.equal(row.ai_msg_watermark, 2, '水位只计送审的 2 条');
+      const pending = store.listAiIdleCandidates({ watermark: 0, idleBefore: base + 10_000 }).map((c) => c.id);
+      assert.ok(pending.includes(conv.id), '新消息仍待下一轮整理');
+      store.close();
+    });
+
+    await t('2i 旧 v2 库补列', '已是 user_version=2 但缺 summary_locked 的库重开后幂等补列、数据无损', async () => {
+      const d = path.join(T, `db${storeN++}`); fs.mkdirSync(d);
+      let store = Store.open(d);
+      const conv = addConv(store, 'old-v2', ['旧问题', '旧回答'], 1_700_000_800_000);
+      store.updateConversationMeta(conv.id, { title: '旧标题' });
+      store.close();
+      const raw = new DatabaseSync(path.join(d, 'mem0.db'));
+      raw.exec('ALTER TABLE conversations DROP COLUMN summary_locked');
+      assert.equal(raw.prepare('PRAGMA user_version').get().user_version, 2);
+      assert.ok(!raw.prepare('PRAGMA table_info(conversations)').all().some((c) => c.name === 'summary_locked'));
+      raw.close();
+      store = Store.open(d);
+      const cols = store.db.prepare('PRAGMA table_info(conversations)').all().map((c) => c.name);
+      assert.ok(cols.includes('summary_locked'));
+      const row = store.getConversation(conv.id, { limit: 5 });
+      assert.equal(Number(row.summary_locked), 0);
+      assert.equal(row.title, '旧标题');
+      assert.equal(row.messages.length, 2);
+      store.close();
+      store = Store.open(d); // 再开一次仍幂等
+      assert.equal(store.db.prepare('PRAGMA table_info(conversations)').all().filter((c) => c.name === 'summary_locked').length, 1);
+      store.close();
+    });
+
+    await new Promise((resolve) => {
+      mockServer.close(resolve);
+      if (typeof mockServer.closeAllConnections === 'function') mockServer.closeAllConnections();
+    });
+  }
+
+  // =====================================================================
   // 4. 浏览器插件桥
   // =====================================================================
   {
     const store = freshStore();
-    const port = 3791;
+    const port = await freePort();
     const URLWS = `ws://127.0.0.1:${port}/browser/v1`;
     let bridge;
-    await t('4 bridge', '在 127.0.0.1:3791/browser/v1 启动', async () => { bridge = await startBridge(store, { port }); assert.equal(bridge.url, URLWS); });
+    await t('4 bridge', `在 127.0.0.1:${port}/browser/v1 启动`, async () => { bridge = await startBridge(store, { port }); assert.equal(bridge.url, URLWS); });
     const uncaught = [];
     const onUnc = (e) => uncaught.push(e);
     process.on('uncaughtException', onUnc);
@@ -1956,7 +3567,7 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
         assert.ok(ok.ws); ok.ws.close();
       });
       await t('4 bridge', 'DNS rebinding Host 被拒', async () => {
-        for (const h of ['evil.com:3791', '127.0.0.1.evil.com:3791', 'localhost']) {
+        for (const h of [`evil.com:${port}`, `127.0.0.1.evil.com:${port}`, 'localhost']) {
           const r = await open({ origin: 'chrome-extension://x', headers: { Host: h } });
           assert.ok(r.rejected, `Host ${h} 未被拒`);
         }
@@ -2162,7 +3773,7 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
     });
     await t('5 register', 'Claude：保留 .claude.json 的 0600 权限（register.js:15-19）', () => {
       const mode = fs.statSync(cj).mode & 0o777;
-      assert.equal(mode.toString(8), '600');
+      if (process.platform !== 'win32') assert.equal(mode.toString(8), '600');
     });
     await t('5 register', 'Claude：重复 connect 幂等（内容不变）；URL 变化 → stale → 更新', async () => {
       const before = fs.readFileSync(cj, 'utf8');
@@ -2228,7 +3839,7 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       const d = JSON.parse(fs.readFileSync(wbf, 'utf8'));
       assert.equal(d.theme, 'dark'); assert.deepEqual(d.mcpServers.other, { command: 'x' }); assert.deepEqual(d.mcpServers.mem0, { type: 'http', url: URL1 });
       assert.equal(backups(path.dirname(wbf), 'mcp.json').length, 1);
-      assert.equal((fs.statSync(wbf).mode & 0o777).toString(8), '600');
+      if (process.platform !== 'win32') assert.equal((fs.statSync(wbf).mode & 0o777).toString(8), '600');
       const before = fs.readFileSync(wbf, 'utf8');
       await sleep(2);
       register.connectClient('workbuddy', URL1, H);
@@ -2285,7 +3896,7 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       assert.equal(register.listClients(URL1, H).find((c) => c.id === 'codex').status, 'not_connected');
     });
     await t('5 register', 'Codex：保留 config.toml 的 0600 权限', () => {
-      assert.equal((fs.statSync(cfg).mode & 0o777).toString(8), '600');
+      if (process.platform !== 'win32') assert.equal((fs.statSync(cfg).mode & 0o777).toString(8), '600');
     });
     await t('5 register', 'Codex：带行尾注释的表头 [mcp_servers.mem0] # x 也应被替换（register.js:87）', () => {
       fs.writeFileSync(cfg, '[mcp_servers.mem0] # added by hand\nurl = "http://old/mcp"\n');
@@ -2827,6 +4438,7 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
   });
 
   // ---------- 输出 ----------
+  finished = true; // 已跑到输出阶段，beforeExit 兜底不再触发
   let pass = 0; let fail = 0;
   let sec = '';
   for (const r of results) {

@@ -103,7 +103,7 @@ const demo = [
     ['user', '帮我列一个两人份的周末做饭清单'],
     ['assistant', '周六：番茄牛腩、蒜蓉西兰花。周日：咖喱鸡、味噌汤。'],
   ]],
-  ['zcode', 'local', '修复 MCP 413 断连', 'C:\\Users\\VIVI\\Documents\\Projects\\very-long-workspace-folder-name\\mem0-desktop', 48, [
+  ['zcode', 'local', '修复 MCP 413 断连', 'C:\\Users\\demo\\Documents\\Projects\\very-long-workspace-folder-name\\mem0-desktop', 48, [
     ['user', 'MCP 返回 413 之后下一个请求 ECONNRESET'],
     ['assistant', '返回 413 时加上 connection: close 并销毁请求即可。'],
   ]],
@@ -127,6 +127,21 @@ demo.forEach(([source, ingestMethod, title, workspace, hoursAgo, msgs], i) => {
   if (hoursAgo < 1) trayStats.recordIngest({ conversationId: r.id, source, added: Math.min(r.added, 2 + i) });
 });
 
+// 0.6.0 记忆页演示（仅预览用临时库；正式应用空库为 0 卡 0 事项）
+if (!process.env.MEM0_PREVIEW_EMPTY) {
+  const proj = store.saveProject({ name: 'mem0 0.6.0 升级', state: '推进中', workspace: 'C:\\Users\\demo\\Documents\\Projects\\very-long-workspace-folder-name\\mem0-desktop',
+    progress: '后端 11 步已完成并通过测试，正在做记忆页与设置页前端。', decisions: ['MCP 启动时不注入任何上下文', '后台 AI 只允许写踩坑与经验库'], rejected: ['待确认审批收件箱'], nextStep: '前端截图自查后跑全量测试' });
+  store.saveProject({ name: '个人主页改版', state: '卡住', progress: '等设计稿。', nextStep: '周五前确认首屏方案' });
+  store.saveMemory({ group: '协作与沟通准则', title: '回复风格', body: '先给结论，再给理由；**代码改动附上验证命令**。', tags: [] });
+  store.saveMemory({ group: '环境与工作流', title: '开发环境', body: '- Windows 11 + PowerShell\n- Node 24，包管理用 `npm`', tags: ['Windows'] });
+  store.saveMemory({ group: '踩坑与经验库', title: 'node:sqlite 读纳秒列抛 ERR_OUT_OF_RANGE', body: '64 位纳秒时间戳超出 Number 安全范围，查询时显式列出需要的列，别用 `SELECT *`。', tags: ['SQLite', 'Windows'], originLabel: 'AI 自动沉淀' });
+  store.saveMemory({ group: '踩坑与经验库', title: 'MCP 413 后下一个请求 ECONNRESET', body: '返回 413 时加 `connection: close` 并销毁请求。', tags: ['网络'] });
+  const first = store.listConversations({ limit: 3 });
+  for (const c of first) store.updateConversationMeta(c.id, { projectId: proj.id, summary: c === first[0] ? '定位到 413 后连接未关闭导致下一请求被重置，已加 connection: close。' : undefined });
+}
+const { AiOrganizer } = require('../src/main/ai-organizer');
+const aiOrganizer = new AiOrganizer({ store });
+
 (async () => {
   const services = { mcp: { ok: false, error: null, url: null }, bridge: { ok: false, error: null, url: null } };
   try { const m = await startMcpServer(store, { port: 3790 }); Object.assign(services.mcp, { ok: true, url: m.url }); } catch (e) { services.mcp.error = e.message; }
@@ -145,7 +160,13 @@ demo.forEach(([source, ingestMethod, title, workspace, hoursAgo, msgs], i) => {
     clients: services.mcp.url ? register.listClients(services.mcp.url) : [],
     manualConfig: services.mcp.url ? register.manualConfig(services.mcp.url) : '',
     mcpCallsToday: trayStats.mcpCallsToday(),
+    projects: store.listProjects({ includeArchived: true }),
+    memories: store.listMemories(),
+    memoryGroups: [['个人与职业背景', 'user'], ['协作与沟通准则', 'shield'], ['环境与工作流', 'monitor'], ['踩坑与经验库', 'bulb']]
+      .map(([id, ic]) => ({ id, icon: ic, copyLabel: '复制本页', presetTags: id === '踩坑与经验库' ? ['Windows', '网络', 'SQLite', '采集与前端'] : undefined })),
+    ai: aiOrganizer.getPublicState(),
   });
+  const withState = (o) => ({ ...(o || {}), state: fullState() });
   const trayState = () => {
     const local = ingestor.getStatus();
     const errors = local.filter((x) => x.enabled && x.error).length + (services.mcp.ok ? 0 : 1) + (services.bridge.ok ? 0 : 1);
@@ -159,6 +180,19 @@ demo.forEach(([source, ingestMethod, title, workspace, hoursAgo, msgs], i) => {
     list: (o) => store.listConversations(o || {}),
     search: (q, o) => store.search(q, o || {}),
     read: (id) => store.getConversation(id, { limit: 2000 }),
+    updateConvMeta: (id, patch) => withState(store.updateConversationMeta(id, patch || {})),
+    saveProject: (pj) => { const { settleCards, ...f } = pj || {}; const project = store.saveProject(f); for (const c of settleCards || []) store.saveMemory({ ...c, group: c.group || c.target }); return { project, state: fullState() }; },
+    deleteProject: (id) => withState(store.deleteProject(id)),
+    saveMemory: (c) => withState(store.saveMemory(c || {})),
+    moveMemory: (id, patch) => withState(store.moveMemory(id, patch || {})),
+    deleteMemory: (id) => withState(store.deleteMemory(id)),
+    batchImportMemories: (items) => { let n = 0; let m = 0; for (const it of items || []) { if (it.target === '__new_project__') { store.saveProject({ name: it.title, progress: it.body }); m++; } else { store.saveMemory({ group: it.target, title: it.title, body: it.body }); n++; } } return { importedMemories: n, importedProjects: m, state: fullState() }; },
+    splitImportText: (raw, g) => aiOrganizer.splitImportWithAI(raw, g),
+    saveAiConfig: (cfg) => { aiOrganizer.saveConfig(cfg || {}); return fullState(); },
+    testAiConfig: async (cfg) => ({ ...(await aiOrganizer.testConfig(cfg || {})), state: fullState() }),
+    organizeOld: async (o) => ({ ...(await aiOrganizer.organizeOldConversations(o || {})), state: fullState() }),
+    exportMemoryPack: () => ({ ok: true, canceled: true }),
+    importMemoryPack: () => ({ ok: true, canceled: true, state: fullState() }),
     remove: () => false,
     setSource: (s, en) => { store.setSourceEnabled(s, !!en); return fullState(); },
     rescan: async () => { await ingestor.scanOnce(); return fullState(); },
@@ -166,7 +200,7 @@ demo.forEach(([source, ingestMethod, title, workspace, hoursAgo, msgs], i) => {
     disconnectClient: () => fullState(),
     pairCode: () => (bridge ? bridge.newPairCode() : null),
     revokeExtensions: () => fullState(),
-    setTheme: (p) => p, copy: () => true, openDataDir: () => true, openUrl: () => true,
+    setTheme: (p) => p, copy: () => true, openDataDir: () => true, openUrl: () => true, changeDataDir: () => null, reportNav: () => true,
     'tray.state': () => trayState(),
     'tray.rescan': logged('tray.rescan', async () => { await new Promise((r) => setTimeout(r, 300)); await ingestor.scanOnce(); return trayState(); }),
     'tray.resize': logged('tray.resize'),
@@ -174,6 +208,7 @@ demo.forEach(([source, ingestMethod, title, workspace, hoursAgo, msgs], i) => {
     'tray.openMain': logged('tray.openMain'),
     'tray.openConversation': logged('tray.openConversation'),
     'tray.quit': logged('tray.quit'),
+    'tray.ready': () => true,
   };
 
   // IPC → HTTP。on* 订阅存进 window.__mem0Handlers，测试用 window.__emit(channel, payload) 模拟主进程推送
@@ -181,7 +216,7 @@ demo.forEach(([source, ingestMethod, title, workspace, hoursAgo, msgs], i) => {
     const handlers = window.__mem0Handlers = {};
     const sub = (ch) => (fn) => { (handlers[ch] ||= []).push(fn); return () => { handlers[ch] = handlers[ch].filter((f) => f !== fn); }; };
     window.__emit = (ch, p) => (handlers[ch] || []).forEach((f) => f(p));
-    const SUBS = { onChanged: 'changed', onNavigate: 'navigate', onMcpCalls: 'mcp-calls', onState: 'tray-state' };
+    const SUBS = { onChanged: 'changed', onNavigate: 'navigate', onMcpCalls: 'mcp-calls', onState: 'tray-state', onPrepare: 'tray-prepare', onReset: 'tray-reset' };
     const invoke = (ch) => (...args) => fetch('/ipc', { method: 'POST', body: JSON.stringify({ ch, args }) }).then(r => r.json()).then(r => { if (r.error) throw new Error(r.error); return r.result; });
     const make = (prefix) => new Proxy({}, { get: (_, k) => {
       if (k === 'tray' && !prefix) return make('tray.');
@@ -199,7 +234,7 @@ demo.forEach(([source, ingestMethod, title, workspace, hoursAgo, msgs], i) => {
     if (req.method === 'POST' && req.url === '/ipc') {
       let body = ''; for await (const c of req) body += c;
       const { ch, args } = JSON.parse(body);
-      try { res.end(JSON.stringify({ result: await ipc[ch](...(args || [])) })); } catch (e) { res.end(JSON.stringify({ error: e.message })); }
+      try { if (typeof ipc[ch] !== 'function') throw new Error(`preview: 未实现的 IPC 通道 ${ch}`); res.end(JSON.stringify({ result: await ipc[ch](...(args || [])) })); } catch (e) { res.end(JSON.stringify({ error: e.message })); }
       return;
     }
     if (req.url === '/shim.js') { res.setHeader('content-type', 'text/javascript'); return res.end(shim); }

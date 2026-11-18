@@ -173,7 +173,7 @@ fs.utimesSync(dDb, old / 1000, old / 1000);
   const client = new Client({ name: 'selftest', version: '1' });
   await client.connect(new StreamableHTTPClientTransport(new URL(mcp.url)));
   const tools = (await client.listTools()).tools.map((t) => t.name).sort();
-  assert.deepEqual(tools, ['list_conversations', 'recall']);
+  assert.deepEqual(tools, ['get_memory_context', 'list_conversations', 'recall', 'save_memory']);
   const rc = (await client.callTool({ name: 'recall', arguments: { query: 'JWT', alternatives: ['refreshToken', '登录'] } })).content[0].text;
   assert.ok(rc.includes('【1】来源：Claude Code'), rc);
   assert.ok(/\[用户\] |\[AI\] /.test(rc), '片段带角色标签');
@@ -182,12 +182,34 @@ fs.utimesSync(dDb, old / 1000, old / 1000);
   const said = (x) => x.split('\n').filter((l) => /^\[(用户|AI)\] /.test(l));
   assert.ok(rc2.includes(`process_id: ${pid}`), 'process_id 原样回显');
   assert.ok(said(rc2).every((l) => !said(rc).includes(l)), '同 process_id 不重复交付');
+  // save_memory → get_memory_context → list_conversations({ project }) 联调
+  const savedCard = await client.callTool({ name: 'save_memory', arguments: {
+    target_type: 'card', group: '踩坑与经验库', title: 'MCP 联调经验卡',
+    body: 'MCP 写入的经验结论：联调必须校验读回结果。', tags: ['MCP', '联调'],
+  } });
+  assert.ok(!savedCard.isError, savedCard.content[0].text);
+  const savedProj = await client.callTool({ name: 'save_memory', arguments: {
+    target_type: 'project', project: 'MCP 联调事项', state: '推进中', workspace: '/Users/me/proj',
+    progress: '已完成 save_memory 写入', decisions: ['MCP 写入事项简报'], next_step: '读回验证',
+  } });
+  assert.ok(!savedProj.isError, savedProj.content[0].text);
+  const ctxOverview = (await client.callTool({ name: 'get_memory_context', arguments: {} })).content[0].text;
+  assert.ok(ctxOverview.includes('踩坑与经验库：1 张卡'), ctxOverview);
+  assert.ok(ctxOverview.includes('MCP 联调事项'), ctxOverview);
+  const ctxCards = (await client.callTool({ name: 'get_memory_context', arguments: { groups: ['踩坑与经验库'] } })).content[0].text;
+  assert.ok(ctxCards.includes('## MCP 联调经验卡') && ctxCards.includes('联调必须校验读回结果'), ctxCards);
+  const ctxProj = (await client.callTool({ name: 'get_memory_context', arguments: { project: 'MCP 联调事项' } })).content[0].text;
+  assert.ok(ctxProj.includes('已拍板结论') && ctxProj.includes('MCP 写入事项简报') && ctxProj.includes('下一步待办'), ctxProj);
+  const projList = (await client.callTool({ name: 'list_conversations', arguments: { project: 'MCP 联调事项' } })).content[0].text;
+  assert.ok(projList.includes('修复登录接口的 JWT 过期问题') && projList.includes('· 事项：MCP 联调事项'), projList);
+  const badSave = await client.callTool({ name: 'save_memory', arguments: { target_type: 'card', group: '踩坑与经验库', title: '缺正文' } });
+  assert.ok(badSave.isError, 'save_memory 缺必填字段应报错');
   const ld = (await client.callTool({ name: 'list_conversations', arguments: { from: '2026-02-30', to: '2026-03-01' } }));
   assert.ok(ld.isError, '非法日期应报错');
   await client.close();
   const bad = await fetch(mcp.url, { method: 'POST', headers: { origin: 'https://evil.example', 'content-type': 'application/json' }, body: '{}' });
   assert.equal(bad.status, 403, '跨站 Origin 应被拒绝');
-  console.log('✓ MCP 服务（list_conversations + recall 两个工具、去重、日期校验 + Origin 防护）');
+  console.log('✓ MCP 服务（list_conversations + recall + get_memory_context + save_memory 四个工具、写入联调、去重、日期校验 + Origin 防护）');
 
   // 4. 插件桥
   const bport = 39791;
@@ -244,7 +266,8 @@ fs.utimesSync(dDb, old / 1000, old / 1000);
   assert.equal(cj.mcpServers.mem0.url, mcp.url); assert.ok(cj.mcpServers.other); assert.equal(cj.numStartups, 3);
   const toml = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8');
   assert.equal(toml.match(/\[mcp_servers\.mem0\]/g).length, 1); assert.ok(toml.includes('[mcp_servers.other]'));
-  assert.deepEqual(register.listClients(mcp.url, home).map((c) => c.status), ['connected', 'connected', 'not_installed']); // 第三个是 WorkBuddy（临时 HOME 下无 ~/.workbuddy）
+  // 5 个客户端：Claude Code / Codex 已连接；WorkBuddy 未安装；DimCode 与 Antigravity 目录由上面的夹具创建，尚未配置 → not_connected
+  assert.deepEqual(register.listClients(mcp.url, home).map((c) => c.status), ['connected', 'connected', 'not_installed', 'not_connected', 'not_connected']);
   register.disconnectClient('codex', home);
   assert.ok(!fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8').includes('mem0'));
   assert.ok(fs.readdirSync(path.join(home, '.codex')).some((f) => f.includes('.mem0-backup-')), '应有备份');

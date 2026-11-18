@@ -62,6 +62,7 @@ async function read(file, root) {
   const messages = [];
   let sessionId = null;
   let cwd = null;
+  let strippedBlocks = 0;
   for await (const line of readLines(file)) {
     if (!line.trim()) continue;
     let ev;
@@ -75,16 +76,19 @@ async function read(file, root) {
       continue;
     }
     if (ev.type === 'session_meta' && ev.payload) {
+      // 子代理会话（对象或非空字符串）不单独保存
+      if (ev.payload.source && ev.payload.source.subagent) return null;
       sessionId = ev.payload.id || sessionId;
       cwd = ev.payload.cwd || cwd;
       continue;
     }
     if (ev.type === 'response_item') item = ev.payload;
-    else if (ev.type && ev.type !== 'message') continue;
-    if (!item || item.type !== 'message') continue;
-    if (item.role !== 'user' && item.role !== 'assistant') continue;
+    else if (ev.type && ev.type !== 'message') { strippedBlocks++; continue; }
+    if (!item || item.type !== 'message') { strippedBlocks++; continue; }
+    if (item.role !== 'user' && item.role !== 'assistant') { strippedBlocks++; continue; }
     const text = textOf(item.content);
-    if (!text || (item.role === 'user' && INJECTED.test(text))) continue;
+    if (!text) continue;
+    if (item.role === 'user' && INJECTED.test(text)) { strippedBlocks++; continue; }
     messages.push({ role: item.role, content: text, createdAt: Number.isFinite(ts) ? ts : undefined });
   }
   if (!messages.length) return null;
@@ -93,7 +97,7 @@ async function read(file, root) {
     sessionId = m ? m[1] : path.basename(file, '.jsonl');
   }
   const t = (await titles(root)).get(sessionId);
-  return { source: ID, externalId: sessionId, title: t, workspace: cwd, messages, ingestMethod: 'local' };
+  return { source: ID, externalId: sessionId, title: t, workspace: cwd, messages, strippedBlocks, ingestMethod: 'local' };
 }
 
 module.exports = { id: ID, label: 'Codex', discover, read };

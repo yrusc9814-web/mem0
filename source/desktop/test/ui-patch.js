@@ -152,6 +152,7 @@ function makeFakeElectron({ trayBounds, cursor, display }) {
   };
   fake.dialog.showOpenDialog = async () => ({ canceled: true, filePaths: [] });
   fake.app.relaunch = () => {};
+  fake.app.setAppUserModelId = () => {}; // Windows 下 src/main/index.js:20 会调用
   return fake;
 }
 
@@ -281,17 +282,19 @@ function runAppRenderer() {
     }
     set className(v) { this._cls = new Set(String(v).split(/\s+/).filter(Boolean)); }
     get className() { return [...this._cls].join(' '); }
+    get firstChild() { return this.children[0]; }
     get lastChild() { return this.children[this.children.length - 1]; }
-    setAttribute(k, v) { this.attrs[k] = String(v); if (k === 'id') this.id = String(v); }
+    setAttribute(k, v) { this.attrs[k] = String(v); if (k === 'id') this.id = String(v); if (k === 'disabled') this.disabled = true; if (k === 'checked') this.checked = true; }
     getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
-    removeAttribute(k) { delete this.attrs[k]; }
+    removeAttribute(k) { delete this.attrs[k]; if (k === 'disabled') this.disabled = false; if (k === 'checked') this.checked = false; }
     addEventListener(t, fn) { (this.listeners[t] = this.listeners[t] || []).push(fn); }
     removeEventListener(t, fn) { const a = this.listeners[t] || []; const i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); }
     dispatch(t, e = {}) { return Promise.all((this.listeners[t] || []).map((fn) => fn(e))); }
     click() { return this.dispatch('click', { target: this, stopPropagation() {} }); }
     append(...k) {
+      // 与浏览器原生语义一致：null / undefined / false 不再被吞掉，而是变成文本节点 "null"/"undefined"/"false"，
+      // 这样全文本节点扫描才能抓到任何绕过 fill() 的裸值。
       for (const x of k.flat()) {
-        if (x === null || x === undefined || x === false) continue;
         if (x instanceof El) {
           if (x.tag === '#fragment') { for (const c of x.children) { c.parent = this; this.children.push(c); } } else { x.parent = this; this.children.push(x); }
         } else this.children.push(doc.createTextNode(String(x)));
@@ -317,8 +320,9 @@ function runAppRenderer() {
   }
   const doc = new El('document');
   doc.documentElement = new El('html');
+  doc.body = new El('body');
   const ids = new Map();
-  const el = (id) => { if (!ids.has(id)) { const e = new El('div'); e.id = id; ids.set(id, e); } return ids.get(id); };
+  const el = (id) => { if (!ids.has(id)) { const e = new El('div'); e.id = id; ids.set(id, e); doc.body.append(e); } return ids.get(id); };
   doc.querySelector = (sel) => (sel.startsWith('#') ? el(sel.slice(1)) : null);
   doc.querySelectorAll = () => [];
   doc.createElement = (t) => new El(t);
@@ -336,8 +340,14 @@ function runAppRenderer() {
     setTheme: () => {}, openDataDir: () => {}, changeDataDir: async () => null, openUrl: () => {}, reportNav: (n) => calls.reportNav.push(n),
     onChanged: () => {}, onNavigate: () => {}, onMcpCalls: () => {},
   };
+  const storage = new Map();
+  const localStorage = {
+    getItem: (k) => (storage.has(String(k)) ? storage.get(String(k)) : null),
+    setItem: (k, v) => storage.set(String(k), String(v)),
+    removeItem: (k) => storage.delete(String(k)),
+  };
   const ctx = {
-    document: doc, mem0, Node, El, Intl, Date, Promise, setTimeout, clearTimeout, console, CSS: { escape: (s) => s },
+    document: doc, mem0, localStorage, Node, El, Intl, Date, Promise, setTimeout, clearTimeout, console, CSS: { escape: (s) => s },
     icon: () => new El('svg'), sourceLogo: () => new El('img'), brandMark: () => new El('img'),
     MEM0_SOURCES: {}, innerHeight: 900,
     matchMedia: () => ({ matches: false, addEventListener: () => {} }),
@@ -350,6 +360,8 @@ function runAppRenderer() {
   ctx.cancelAnimationFrame = (id) => { calls.cancelled.push(id); rafs.delete(id); };
   ctx.window = ctx;
   vm.runInNewContext(read('src/renderer/app.js'), ctx, { filename: 'app.js' });
+  // v4：同一上下文里先 app.js 后 memory.js，扩展通过 window.mem0Ext 挂载
+  vm.runInContext(read('src/renderer/memory.js'), ctx, { filename: 'memory.js' });
   const ev = (code) => vm.runInContext(code, ctx);
   const setState = (s) => { stateImpl = async () => s; };
   const text = (n) => (n.tag === '#text' ? n.textContent : n.children.map(text).join(''));
@@ -820,6 +832,21 @@ const W = PANEL_WIDTH + INSET * 2;
     const s = await app.invoke('state', app.main);
     assert.equal(typeof s.mcpCallsToday, 'number');
   });
+  await test('空库 state 扩展 projects / memories / memoryGroups / ai：两个集合为空数组，ai 不含 apiKey', async () => {
+    const s = await app.invoke('state', app.main);
+    assert.ok(Array.isArray(s.projects), 'projects 为数组');
+    assert.ok(Array.isArray(s.memories), 'memories 为数组');
+    assert.deepEqual(s.projects, [], '空库 projects 为空数组（未混入演示数据）');
+    assert.deepEqual(s.memories, [], '空库 memories 为空数组（未混入演示数据）');
+    assert.equal(s.memoryGroups.length, 4, '4 个固定记忆分组');
+    assert.deepEqual(s.memoryGroups.map((g) => g.id), ['个人与职业背景', '协作与沟通准则', '环境与工作流', '踩坑与经验库']);
+    for (const g of s.memoryGroups) assert.equal(typeof g.icon, 'string');
+    assert.ok(s.ai && typeof s.ai === 'object', 'ai 为对象');
+    assert.equal(Object.prototype.hasOwnProperty.call(s.ai, 'apiKey'), false, 'ai 不含 apiKey 字段');
+    assert.equal(JSON.stringify(s.ai).includes('apiKey'), false, 'ai 序列化后也不含 apiKey');
+    assert.equal(typeof s.ai.hasKey, 'boolean');
+    assert.equal(typeof s.ai.statusText, 'string');
+  });
   await test('MCP 地址对外带 token：services.mcp.url 与手动配置用同一份完整地址', async () => {
     const s = await app.invoke('state', app.main);
     assert.equal(s.services.mcp.url, 'http://127.0.0.1:3790/mcp?token=uitest-token');
@@ -1144,6 +1171,48 @@ const W = PANEL_WIDTH + INSET * 2;
     assert.ok(read('src/renderer/icons.js').includes("mark: 'brand/mem0-mark.png'"));
     assert.ok(fs.existsSync(path.join(ROOT, 'src/renderer/brand/mem0-mark.png')));
   });
+  await test('v4 顶栏 4 个导航项（含记忆页）、记录页排序切换、记忆页与设置页容器齐全', () => {
+    const header = /<header class="top">([\s\S]*?)<\/header>/.exec(index);
+    assert.ok(header, '存在顶栏');
+    assert.equal((header[1].match(/class="nav"/g) || []).length, 4, '顶栏恰好 4 个 .nav');
+    for (const v of ['home', 'records', 'memory', 'connect']) assert.match(header[1], new RegExp(`class="nav"[^>]*data-view="${v}"`), v);
+    assert.match(header[1], /data-view="memory"/, '含记忆页导航');
+    const seg = /<div class="mode-seg" id="rec-mode-seg"[\s\S]*?<\/div>/.exec(index);
+    assert.ok(seg, '存在 #rec-mode-seg');
+    assert.match(seg[0], /data-rmode="time"/); assert.match(seg[0], /data-rmode="project"/);
+    for (const id of ['settings-ai', 'view-memory', 'mem-nav', 'mem-track', 'home-projects']) assert.match(index, new RegExp(`id="${id}"`), id);
+  });
+  await test('v4 加载 memory-clean.css 与 memory.js（app.js 之后），且无 demo-data 演示数据', () => {
+    const cssAt = index.indexOf('href="memory-clean.css"');
+    const appAt = index.indexOf('src="app.js"');
+    const memAt = index.indexOf('src="memory.js"');
+    assert.ok(cssAt >= 0, '加载 memory-clean.css');
+    assert.ok(appAt >= 0 && memAt > appAt, 'memory.js 在 app.js 之后加载');
+    const rendererDir = path.join(ROOT, 'src/renderer');
+    const files = [];
+    const walk = (dir) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (/\.(html|js)$/i.test(e.name)) files.push(p);
+      }
+    };
+    walk(rendererDir);
+    assert.equal(files.some((f) => path.basename(f) === 'demo-data.js'), false, 'src/renderer 下不得存在 demo-data.js');
+    for (const f of files) assert.doesNotMatch(fs.readFileSync(f, 'utf8'), /demo-data/i, path.relative(ROOT, f));
+  });
+  await test('v4 CSP 仍与 tray.html 完全一致，且无内联 style / on* 事件 / insertAdjacentHTML', () => {
+    assert.ok(csp(index)); assert.equal(csp(index), csp(tray));
+    assert.match(csp(index), /style-src 'self'/); assert.doesNotMatch(csp(index), /unsafe-inline|https?:/);
+    const strip = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    for (const f of ['src/renderer/app.js', 'src/renderer/memory.js']) {
+      const js = strip(read(f));
+      assert.doesNotMatch(js, /\bstyle\s*=\s*["']/, `${f} 含内联 style 属性串`);
+      assert.doesNotMatch(js, /\bon[a-z]+\s*=\s*["']/i, `${f} 含内联事件`);
+      assert.doesNotMatch(js, /insertAdjacentHTML/, `${f} 含 insertAdjacentHTML`);
+      assert.doesNotMatch(js, /setAttribute\(\s*['"]style/, `${f} 用 setAttribute 设置 style`);
+    }
+  });
 
   // ======================================================================
   section('7 渲染层：退出确认条 + 显示握手（vm 里跑真实 tray.js，最小假 DOM）');
@@ -1334,6 +1403,8 @@ const W = PANEL_WIDTH + INSET * 2;
   // ======================================================================
   section('9 会话详情分页 / 复制时才取全文 / 删除时清理大纲（vm 里跑真实 app.js）');
   const A = runAppRenderer();
+  const detailActions = () => A.byClass(A.el('detail'), 'detail-actions')[0];
+  const detailCopyBtn = () => A.byClass(detailActions(), 'head-copy-btn')[0];
   const convOf = (n, prefix = 'm') => ({
     id: 'conv-1', source: 'claude-code', title: '长会话', message_count: n, updated_at: 1_700_000_000_000,
     messages: Array.from({ length: Math.min(n, 200) }, (_, i) => ({ seq: n - Math.min(n, 200) + i, role: i % 2 ? 'assistant' : 'user', content: `${prefix}${n - Math.min(n, 200) + i}`, created_at: 1_700_000_000_000 + i })),
@@ -1368,7 +1439,7 @@ const W = PANEL_WIDTH + INSET * 2;
   });
   await test('复制全文：点击时才分页读完再拼接（从 seq 0 起，每页 200）', async () => {
     A.calls.read.length = 0; A.calls.copy.length = 0;
-    const btn = A.byClass(A.el('detail'), 'float')[0].children[0];
+    const btn = detailCopyBtn();
     await btn.click();
     const full = A.calls.read.filter(([, o]) => o && o.limit && !o.tail);
     assert.deepEqual(A.plain(full.map(([, o]) => [o.fromSeq, o.limit])), [[0, 200], [200, 200], [400, 200]]);
@@ -1377,7 +1448,7 @@ const W = PANEL_WIDTH + INSET * 2;
   });
   await test('复制全文：与打开详情时取的消息无关，每次都重新按页读取', async () => {
     A.calls.read.length = 0;
-    const btn = A.byClass(A.el('detail'), 'float')[0].children[0];
+    const btn = detailCopyBtn();
     await btn.click();
     assert.equal(A.calls.read.filter(([, o]) => o && o.limit && !o.tail).length, 3);
   });
@@ -1542,6 +1613,277 @@ const W = PANEL_WIDTH + INSET * 2;
     assert.equal(head.classList.contains('show'), false);
   });
 
+  // ======================================================================
+  section('10b v4 摘要卡 / 复制全文（vm 里真实 app.js + memory.js）');
+  const v4conv = (extra) => ({
+    id: 'conv-v4', source: 'claude-code', title: '带摘要的会话', message_count: 3, updated_at: 1_700_000_000_000,
+    messages: [
+      { seq: 0, role: 'user', content: 'u0' },
+      { seq: 1, role: 'assistant', content: 'a1' },
+      { seq: 2, role: 'user', content: 'u2' },
+    ], ...extra,
+  });
+  const v4read = (conv) => async (id, opts) => {
+    if (opts && opts.tail) return { ...conv, messages: conv.messages.slice(-opts.tail) };
+    const from = opts.fromSeq || 0;
+    return { ...conv, messages: conv.messages.slice(from, from + (opts.limit || conv.messages.length)) };
+  };
+  await test('无 summary / decisions / next_step 的会话不渲染 .sum-card 空框', async () => {
+    const conv = v4conv({});
+    A.ctx.mem0.read = v4read(conv);
+    await A.ctx.openConversation(conv.id, []);
+    assert.equal(A.byClass(A.el('detail'), 'sum-card').length, 0);
+  });
+  await test('有 summary 的会话渲染 .sum-card 并显示摘要', async () => {
+    const conv = v4conv({ summary: '这次把导出流程修好了', decisions_json: '[]', next_step: '' });
+    A.ctx.mem0.read = v4read(conv);
+    await A.ctx.openConversation(conv.id, []);
+    const cards = A.byClass(A.el('detail'), 'sum-card');
+    assert.equal(cards.length, 1);
+    assert.match(A.text(cards[0]), /这次把导出流程修好了/);
+  });
+  await test('无摘要会话「复制全文」输出仍是纯 ## 我 / ## AI', async () => {
+    const conv = v4conv({});
+    A.ctx.mem0.read = v4read(conv);
+    await A.ctx.openConversation(conv.id, []);
+    A.calls.copy.length = 0;
+    const btn = detailCopyBtn();
+    await btn.click();
+    assert.equal(A.calls.copy[0], '## 我\n\nu0\n\n## AI\n\na1\n\n## 我\n\nu2');
+  });
+  await test('有摘要时「复制全文」顶部为 # 标题 / > 摘要：… 前缀', async () => {
+    const conv = v4conv({ summary: '这是摘要' });
+    A.ctx.mem0.read = v4read(conv);
+    await A.ctx.openConversation(conv.id, []);
+    A.calls.copy.length = 0;
+    const btn = detailCopyBtn();
+    await btn.click();
+    assert.equal(A.calls.copy[0], '# 带摘要的会话\n\n> 摘要：这是摘要\n\n## 我\n\nu0\n\n## AI\n\na1\n\n## 我\n\nu2');
+  });
+
+  // ======================================================================
+  section('10c v4 前端回归：裸文本扫描 / 详情操作区 / 关联会话折叠 / 设置页旧会话');
+  const MEM_GROUPS = ['个人与职业背景', '协作与沟通准则', '环境与工作流', '踩坑与经验库']
+    .map((id) => ({ id, icon: 'bulb', copyLabel: '复制本页' }));
+  const baseState = (over = {}) => ({
+    stats: { total: 3, messages: 30, today: 1, todayMessages: 2, bySource: { 'claude-code': 3 }, messagesBySource: { 'claude-code': 30 }, todayBySource: {} },
+    localSources: [{ id: 'claude-code', label: 'Claude Code', found: true, enabled: true }],
+    webSources: [], bridge: { connected: false, paired: false },
+    services: { mcp: { ok: true, starting: false, url: 'http://127.0.0.1:3790/mcp?token=t' }, bridge: { ok: true, starting: false, url: 'ws://x' } },
+    clients: [], mcpCallsToday: 0, dataDir: '/tmp', version: '0.6.0', manualConfig: '{}',
+    memories: [], projects: [], memoryGroups: MEM_GROUPS,
+    ai: { enabled: true, provider: 'deepseek', baseUrl: '', model: '', hasKey: false, keyHint: '', statusText: '已就绪', statusOk: true, unorganizedCount: 0, organizing: false },
+    ...over,
+  });
+  const setFullState = (over = {}) => A.ev(`state = ${JSON.stringify(baseState(over))}`);
+  const projectOf = (extra = {}) => ({
+    id: 'p1', name: '推进事项甲', state: '推进中', archived: false, workspace: '/w/p1',
+    progress: '进行中', decisions: ['结论一'], rejected: [], nextStep: '下一步',
+    createdAt: 1_700_000_000_000, updatedAt: 1_700_000_000_000, ...extra,
+  });
+  const BAD_TEXT = new Set(['null', 'undefined', 'false', 'NaN']);
+  const badTextNodes = (root = A.ctx.document.body) => A.all(root)
+    .filter((n) => n.tag === '#text' && BAD_TEXT.has(String(n.textContent).trim()))
+    .map((n) => String(n.textContent).trim());
+  const assertNoBadText = (label) => {
+    const bad = badTextNodes();
+    assert.deepEqual(bad, [], `${label}：document.body 下出现裸文本节点 ${JSON.stringify(bad)}`);
+  };
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  await test('扫描工具灵敏度：直接 append(null) 产生的裸 "null" 文本节点能被抓到（假 DOM 原生语义）', () => {
+    A.ev('window.__nullProbe = document.createElement("span"); window.__nullProbe.append(null); document.body.append(window.__nullProbe);');
+    assert.deepEqual(badTextNodes(), ['null'], '假 DOM 应把 null 变成 "null" 文本节点并被扫描抓到');
+    A.ev('window.__nullProbe.remove()');
+    assert.deepEqual(badTextNodes(), []);
+  });
+
+  await test('首页渲染后 document.body 下无裸 null/undefined/false/NaN 文本节点', async () => {
+    setFullState();
+    A.ctx.mem0.list = async () => [{ id: 'c1', source: 'claude-code', title: '一条会话', message_count: 4, updated_at: 1_700_000_000_000 }];
+    await A.ctx.renderHome();
+    assertNoBadText('首页');
+  });
+
+  await test('记录页详情（无摘要）：无 .float、复制按钮为 .head-copy-btn「复制全文」、meta 内有胶囊、无锁/备注', async () => {
+    const conv = v4conv({});
+    A.ctx.mem0.read = v4read(conv);
+    await A.ctx.openConversation(conv.id, []);
+    const detail = A.el('detail');
+    assert.equal(A.byClass(detail, 'float').length, 0, '旧的底部悬浮 .float 复制按钮应已删除');
+    const actions = detailActions();
+    assert.equal(actions.children[0], detailCopyBtn(), '.detail-actions 第一个按钮应是复制按钮');
+    assert.ok(detailCopyBtn()._cls.has('head-copy-btn'));
+    assert.equal(A.text(detailCopyBtn()).trim(), '复制全文');
+    const meta = A.byClass(detail, 'meta')[0];
+    assert.ok(meta, '详情应有 .meta 行');
+    assert.ok(A.byClass(meta, 'meta-chip').length >= 1, '事项胶囊 .meta-chip 应在 .meta 行内');
+    const dt = A.text(detail);
+    assert.ok(!dt.includes('锁'), '详情区不应出现「锁」字');
+    assert.ok(!dt.includes('备注'), '详情区不应出现「备注」字样');
+    assert.equal(A.byClass(detail, 'lock-pill').length, 0);
+    assert.ok(!dt.includes('已手动锁定'));
+    assert.equal(A.byClass(detail, 'sum-card').length, 0, '无摘要不渲染 .sum-card');
+    assertNoBadText('记录页详情（无摘要）');
+  });
+
+  await test('记录页详情（有摘要）：.sum-card 标题为「会话摘要」，复制按钮为「复制摘要与全文」', async () => {
+    const conv = v4conv({ summary: '这次把导出流程修好了' });
+    A.ctx.mem0.read = v4read(conv);
+    await A.ctx.openConversation(conv.id, []);
+    const detail = A.el('detail');
+    assert.equal(A.byClass(detail, 'float').length, 0);
+    assert.equal(A.text(detailCopyBtn()).trim(), '复制摘要与全文');
+    const cards = A.byClass(detail, 'sum-card');
+    assert.equal(cards.length, 1);
+    const titles = A.byClass(cards[0], 'sum-hd-title');
+    assert.equal(titles.length, 1);
+    assert.equal(A.text(titles[0]).trim(), '会话摘要');
+    assert.ok(A.text(detail).includes('这次把导出流程修好了'));
+    assertNoBadText('记录页详情（有摘要）');
+  });
+
+  await test('记录页详情（编辑态）：点编辑图标进入表单，仍无裸文本/锁/备注', async () => {
+    const conv = v4conv({ summary: '这是摘要' });
+    A.ctx.mem0.read = v4read(conv);
+    await A.ctx.openConversation(conv.id, []);
+    const editBtn = detailActions().children.find((b) => b._cls && b._cls.has('icon-btn') && /标题/.test(String(b.attrs.title || b.title)));
+    assert.ok(editBtn, '详情操作区应有编辑标题 / 摘要的图标按钮');
+    await editBtn.click();
+    await tick();
+    const detail = A.el('detail');
+    const titles = A.byClass(detail, 'sum-hd-title');
+    assert.equal(titles.length, 1);
+    assert.equal(A.text(titles[0]).trim(), '编辑会话标题与摘要');
+    const dt = A.text(detail);
+    assert.ok(!dt.includes('锁') && !dt.includes('备注'));
+    assertNoBadText('记录页详情（编辑态）');
+  });
+
+  await test('记忆页分组视图：渲染卡片后无裸文本节点', async () => {
+    setFullState({
+      memories: [
+        { id: 'm1', group: '个人与职业背景', title: '背景一', body: '正文一', tags: [], sourceIds: [], originLabel: '手动录入', superseded: '', updatedAt: 1_700_000_000_000 },
+        { id: 'm2', group: '个人与职业背景', title: '背景二', body: '正文二', tags: ['标签'], sourceIds: ['conv-1'], originLabel: '手动录入', superseded: '', updatedAt: 1_700_000_001_000 },
+      ],
+    });
+    A.ev('window.mem0Ext.openMemory({ type: "group", id: "个人与职业背景" })');
+    assert.ok(A.byClass(A.el('mem-track'), 'topic-card').length >= 2, '分组视图应渲染卡片');
+    assertNoBadText('记忆页分组视图');
+  });
+
+  await test('推进事项详情：收起态只有汇总条、无 mini-list；展开态行数等于 list 条数', async () => {
+    const rows = [
+      { id: 'c1', source: 'claude-code', title: '会话甲', updated_at: 1_700_000_000_000 },
+      { id: 'c2', source: 'codex', title: '会话乙', updated_at: 1_700_000_001_000 },
+      { id: 'c3', source: 'gemini-web', title: '会话丙', updated_at: 1_700_000_002_000 },
+    ];
+    setFullState({ projects: [projectOf()] });
+    A.ctx.mem0.list = async () => rows;
+    A.ev('window.mem0Ext.openMemory({ type: "project", id: "p1" })');
+    await tick();
+    let bars = A.byClass(A.el('mem-track'), 'psess-fold-bar');
+    assert.equal(bars.length, 1, '应有一个 .psess-fold-bar');
+    assert.equal(bars[0].children.filter((n) => n instanceof A.ctx.El).length, 1, '收起态只有一个子元素（汇总条）');
+    assert.equal(A.byClass(bars[0], 'psess-mini-list').length, 0, '收起态不含 .psess-mini-list');
+    assertNoBadText('推进事项关联会话（收起态）');
+    const openBtn = A.byClass(bars[0], 'quiet-btn').find((b) => A.text(b).includes('展开'));
+    assert.ok(openBtn, '应有展开按钮');
+    await openBtn.click();
+    await tick();
+    bars = A.byClass(A.el('mem-track'), 'psess-fold-bar');
+    assert.equal(bars.length, 1);
+    const mini = A.byClass(bars[0], 'psess-mini-list');
+    assert.equal(mini.length, 1, '展开态应出现 .psess-mini-list');
+    assert.equal(A.byClass(mini[0], 'psess-mini-row').length, rows.length, '行数应等于 list 返回条数');
+    assertNoBadText('推进事项关联会话（展开态）');
+  });
+
+  await test('推进事项详情：关联会话 0 条时折叠条仍只有一个子元素且无 mini-list', async () => {
+    setFullState({ projects: [projectOf()] });
+    A.ctx.mem0.list = async () => [];
+    A.ev('window.mem0Ext.openMemory({ type: "project", id: "p1" })');
+    await tick();
+    const bars = A.byClass(A.el('mem-track'), 'psess-fold-bar');
+    assert.equal(bars.length, 1);
+    assert.equal(bars[0].children.filter((n) => n instanceof A.ctx.El).length, 1);
+    assert.equal(A.byClass(bars[0], 'psess-mini-list').length, 0);
+    assertNoBadText('推进事项关联会话（0 条）');
+  });
+
+  await test('设置页历史旧会话：count=0 与 37 两侧 data-unorganized 一致、文案/禁用符合规则、无裸文本', async () => {
+    for (const n of [0, 37]) {
+      setFullState({ ai: { ...baseState().ai, unorganizedCount: n } });
+      A.ev('window.mem0Ext.renderAll()');
+      const box = A.el('settings-ai');
+      const ds = A.all(box).find((e) => e._cls && e._cls.has('ds') && e.attrs['data-unorganized'] !== undefined);
+      const oldBtn = A.all(box).find((e) => e.tag === 'button' && e.attrs['data-unorganized'] !== undefined);
+      assert.ok(ds, `count=${n} 应渲染左侧说明`);
+      assert.ok(oldBtn, `count=${n} 应渲染整理按钮`);
+      assert.equal(ds.attrs['data-unorganized'], oldBtn.attrs['data-unorganized'], '两侧 data-unorganized 必须相等');
+      assert.equal(ds.attrs['data-unorganized'], String(n));
+      const dsText = A.text(ds);
+      const btnText = A.text(oldBtn);
+      if (n === 0) {
+        assert.ok(dsText.includes('没有待整理的历史会话'), dsText);
+        assert.equal(btnText, '全部已整理');
+        assert.equal(oldBtn.disabled, true, 'count=0 时按钮应禁用');
+      } else {
+        assert.ok(dsText.includes('37'), dsText);
+        assert.equal(btnText, '整理旧对话 (20)');
+        assert.equal(oldBtn.disabled, false, 'count>0 且已开启 AI 时按钮应可用');
+      }
+      const boxText = A.text(box);
+      assert.ok(!(boxText.includes('没有待整理') && boxText.includes('整理旧对话 (')), `count=${n} 不应同时出现两种文案`);
+      assertNoBadText(`设置页 AI 区（count=${n}）`);
+    }
+  });
+
+  // ======================================================================
+  section('11 主进程 / preload IPC 通道（SPEC 4.4 静态断言）');
+  const indexSrc = read('src/main/index.js');
+  const preloadSrc = read('src/preload/index.js');
+  const ipcMethods = [
+    ['state', 'state'], ['list', 'list'], ['search', 'search'], ['read', 'read'],
+    ['updateConvMeta', 'updateConvMeta'], ['saveProject', 'saveProject'], ['deleteProject', 'deleteProject'],
+    ['saveMemory', 'saveMemory'], ['moveMemory', 'moveMemory'], ['deleteMemory', 'deleteMemory'],
+    ['batchImportMemories', 'batchImportMemories'], ['splitImportText', 'splitImportText'],
+    ['saveAiConfig', 'saveAiConfig'], ['testAiConfig', 'testAiConfig'], ['organizeOld', 'organizeOld'],
+    ['exportMemoryPack', 'exportMemoryPack'], ['importMemoryPack', 'importMemoryPack'],
+  ];
+  await test('preload 在 window.mem0 下暴露全部 v4 方法', () => {
+    for (const [method] of ipcMethods) {
+      assert.match(preloadSrc, new RegExp(`\\b${method}:`), `preload 缺 ${method}`);
+    }
+    for (const [, channel] of ipcMethods) assert.ok(preloadSrc.includes(`'${channel}'`), channel);
+  });
+  await test('index.js 注册全部 v4 IPC 通道，且每条都包在 guard(...) 里', () => {
+    for (const [, channel] of ipcMethods) {
+      assert.ok(indexSrc.includes(`ipcMain.handle('${channel}', guard(`), `通道 ${channel} 未经过 guard`);
+    }
+  });
+  await test('fullState 扩展 projects / memories / memoryGroups / ai（ai 来自 getPublicState）', () => {
+    assert.match(indexSrc, /projects:\s*store\.listProjects\(/);
+    assert.match(indexSrc, /memories:\s*store\.listMemories\(/);
+    assert.match(indexSrc, /memoryGroups:\s*memoryGroupMeta\(\)/);
+    assert.match(indexSrc, /ai:\s*aiOrganizer\s*\?\s*aiOrganizer\.getPublicState\(\)/);
+    // getPublicState 是唯一出口：index.js 不得自行拼出 apiKey 字段
+    assert.doesNotMatch(indexSrc, /\bapiKey\s*:/);
+  });
+  await test('AiOrganizer 由主进程创建并 start / stop，MCP mutated 与整理完成都会推 changed', () => {
+    assert.match(indexSrc, /new AiOrganizer\(\{\s*store,\s*electron\s*\}\)/);
+    assert.match(indexSrc, /aiOrganizer\.start\(\)/);
+    assert.match(indexSrc, /aiOrganizer\?\.stop\(\)/);
+    assert.match(indexSrc, /ev\.on\('mutated',\s*\(\)\s*=>\s*push\('changed',\s*fullState\(\)\)\)/);
+    assert.match(indexSrc, /organizer\.organizeConversation\s*=\s*async\s*\(id\)/);
+    assert.match(indexSrc, /if \(result\) push\('changed', fullState\(\)\)/);
+  });
+  await test('记忆包导出 / 导入使用系统保存 / 打开对话框读写 JSON', () => {
+    assert.match(indexSrc, /showSave\(\{/);
+    assert.match(indexSrc, /showOpen\(\{/);
+    assert.match(indexSrc, /fs\.writeFile\(picked\.filePath, JSON\.stringify\(pack, null, 2\), 'utf8'\)/);
+    assert.match(indexSrc, /JSON\.parse\(await fs\.readFile\(picked\.filePaths\[0\], 'utf8'\)\)/);
+  });
 
   const failed = results.filter((r) => !r.ok);
   process.stdout.write(`\n${results.length - failed.length}/${results.length} passed\n`);

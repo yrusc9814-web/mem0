@@ -264,9 +264,6 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; }
 .code-copy { position: absolute; top: 5px; right: 5px; opacity: .55; background: var(--code); }
 .codeblock:hover .code-copy, .code-copy:focus-visible, .code-copy.done { opacity: 1; }
 .msg.user .body pre.code { background: var(--surface2); }
-.float { position: sticky; bottom: 18px; display: flex; justify-content: center; pointer-events: none; margin-top: auto; padding-top: 8px; }
-.float button { pointer-events: auto; display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 18px; border-radius: 99px; border: 0; background: var(--surface2); color: var(--text); box-shadow: var(--pill-shadow), 0 6px 20px rgba(66,46,26,.08); font-weight: 500; font-size: 13.5px; }
-.float button.done { color: var(--ok); }
 
 /* 提问目录：右缘刻度条，悬停原位展开暖毛玻璃面板 */
 .question-outline { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); z-index: 15; }

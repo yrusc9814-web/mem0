@@ -13,6 +13,19 @@ import { BridgeClient } from '../src/bridge-client.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
+// 桌面端目录解析：MEM0_DESKTOP_DIR → ../mem0-desktop → ../desktop，取第一个 package.json.name === 'mem0-desktop' 的目录。
+function resolveDesktopDir(base) {
+  const candidates = [];
+  if (process.env.MEM0_DESKTOP_DIR) candidates.push(path.resolve(process.env.MEM0_DESKTOP_DIR));
+  candidates.push(path.resolve(base, '..', 'mem0-desktop'), path.resolve(base, '..', 'desktop'));
+  for (const dir of candidates) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+      if (pkg && pkg.name === 'mem0-desktop') return dir;
+    } catch { /* 继续尝试下一个候选目录 */ }
+  }
+  return null;
+}
 const rd = (f) => fs.readFileSync(path.join(root, f), 'utf8');
 const J = (x) => JSON.parse(JSON.stringify(x));
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -403,7 +416,11 @@ function contentChrome(local = {}) {
 }
 
 // ============================================================ 3. BridgeClient × 真实桌面端 bridge
-const desktop = path.resolve(root, '..', 'mem0-desktop');
+const desktop = resolveDesktopDir(root);
+if (!desktop) {
+  console.error('错误：未找到 mem0 桌面端目录（已尝试 MEM0_DESKTOP_DIR、../mem0-desktop、../desktop）。');
+  process.exit(1);
+}
 const dreq = createRequire(path.join(desktop, 'package.json'));
 const { Store } = dreq('./src/main/db.js');
 const { startBridge } = dreq('./src/main/bridge.js');
