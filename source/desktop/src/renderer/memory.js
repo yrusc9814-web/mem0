@@ -614,24 +614,320 @@
   }
 
   // ---------- 设置页：AI 自动整理 ----------
-  const aiDraft = { provider: null, baseUrl: '', model: '', apiKey: '', showKey: false, testing: false, testMsg: '' };
+  const aiDraft = {
+    provider: null, baseUrl: '', model: '', apiKey: '', apiMode: 'chat_completions',
+    reasoningEffort: '', efforts: null, effortsModel: '', effortsKey: '', // 当前模型的原生档位（null 未知 / [] 显式无档位）
+    effortOpen: false, // 无档位模型的「自定义档位」是否展开
+    effortsCache: new Map(), // `${provider}::${origin}::${model}` → efforts
+    showKey: false, testing: false, testMsg: '',
+    models: null, modelsLoading: false, modelFilter: '', // [获取模型] 的本次草稿缓存，绝不落库
+  };
+  /** 推理档位本地记忆（AC4.3）：按 `${provider}::${origin}::${model}` 记，LRU 上限 50 条 */
+  const AI_EFFORT_MEMORY_KEY = 'mem0.aiEffortMemory';
+  const AI_EFFORT_MEMORY_LIMIT = 50;
+  /** 选这些档位时提示后台耗时与 Token 消耗更多（只提示，不阻拦） */
+  const AI_HIGH_EFFORTS = ['high', 'xhigh', 'max', 'ultra'];
   const PRESETS = [
     { id: 'deepseek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat', needKey: true },
     { id: 'gemini', label: 'Gemini Flash', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash', needKey: true },
     { id: 'openai', label: 'OpenAI 兼容 / 中转', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', needKey: true },
     { id: 'ollama', label: '本地 Ollama（免 Key）', baseUrl: 'http://127.0.0.1:11434/v1', model: 'qwen2.5:7b', needKey: false },
   ];
+
+  /* AI_ENDPOINT_PURE_BEGIN
+   * 接口地址纯函数：与主进程 src/main/ai-organizer.js 的 buildEndpoint / buildModelsUrl / apiModeFromBaseUrl 同规则。
+   * 渲染层是 sandbox: true 的隔离环境（preload 无法 require），这里保留一份等价实现供 URL 预览与协议对齐实时调用；
+   * test/independent.js 用同一组用例校验两处结果一致，防止规则漂移。
+   */
+  const AI_MODES = ['chat_completions', 'responses'];
+  const AI_MODE_SUFFIX = { chat_completions: '/chat/completions', responses: '/responses' };
+  /** 仅支持 Chat Completions 的内置预设：点这些胶囊必定切回 chat_completions（AC2.3） */
+  const AI_CHAT_ONLY_PRESETS = ['deepseek', 'gemini', 'ollama'];
+
+  function aiMode(mode, fallback) {
+    if (AI_MODES.includes(mode)) return mode;
+    return AI_MODES.includes(fallback) ? fallback : 'chat_completions';
+  }
+  /** 解析接口地址（new URL() 之前剥离末尾 `#` 锁定标记），非法地址返回 null */
+  function aiParseBase(baseUrl) {
+    let s = String(baseUrl == null ? '' : baseUrl).trim();
+    if (!s) return null;
+    const locked = /#$/.test(s);
+    if (locked) s = s.slice(0, -1).trim();
+    if (!s) return null;
+    let u;
+    try { u = new URL(s); } catch { return null; }
+    if (!/^https?:$/i.test(u.protocol)) return null;
+    u.hash = '';
+    return { locked, url: u, path: u.pathname.replace(/\/+$/, '') };
+  }
+  /** 剥离路径末尾已有的 /chat/completions 或 /responses */
+  function aiStripSuffix(path) {
+    const p = String(path == null ? '' : path);
+    if (/\/chat\/completions$/i.test(p)) return p.slice(0, -AI_MODE_SUFFIX.chat_completions.length);
+    if (/\/responses$/i.test(p)) return p.slice(0, -AI_MODE_SUFFIX.responses.length);
+    return p;
+  }
+  /** 最终请求 URL：末尾 `#` 锁定 / 裸域名补 /v1 / 已有路径先剥协议后缀再补当前后缀 */
+  function aiEndpointUrl(baseUrl, mode) {
+    const suffix = AI_MODE_SUFFIX[aiMode(mode)];
+    const parsed = aiParseBase(baseUrl);
+    if (!parsed) return '';
+    const isRoot = !parsed.path || parsed.path === '/';
+    if (parsed.locked) {
+      if (isRoot) parsed.url.pathname = suffix;
+    } else if (isRoot) {
+      parsed.url.pathname = `/v1${suffix}`;
+    } else {
+      parsed.url.pathname = `${aiStripSuffix(parsed.path)}${suffix}`;
+    }
+    return parsed.url.toString();
+  }
+  /** 站点同源（协议 + 主机 + 端口），非法地址返回空串 */
+  function aiOrigin(baseUrl) {
+    const parsed = aiParseBase(baseUrl);
+    return parsed ? parsed.url.origin : '';
+  }
+  /** 按地址后缀自动对齐协议：/responses → responses，/chat/completions → chat，其它保持当前模式 */
+  function aiModeFromUrl(baseUrl, fallback) {
+    const current = aiMode(fallback);
+    const parsed = aiParseBase(baseUrl);
+    if (!parsed) return current;
+    if (/\/responses$/i.test(parsed.path)) return 'responses';
+    if (/\/chat\/completions$/i.test(parsed.path)) return 'chat_completions';
+    return current;
+  }
+  /** 预设胶囊：DeepSeek / Gemini Flash / 本地 Ollama 切回 chat_completions，其它预设保持 */
+  function aiModeForPreset(id, fallback) {
+    return AI_CHAT_ONLY_PRESETS.includes(String(id == null ? '' : id)) ? 'chat_completions' : aiMode(fallback);
+  }
+  /** 模型自带端点类型对齐：仅 openai-response → responses，仅 openai → chat，未返回类型绝不猜 */
+  function aiModeFromModelTypes(types, fallback) {
+    const list = (Array.isArray(types) ? types : [])
+      .map((t) => String(t == null ? '' : t).trim().toLowerCase()).filter(Boolean);
+    const hasChat = list.includes('openai');
+    const hasResponses = list.includes('openai-response');
+    if (hasResponses && !hasChat) return 'responses';
+    if (hasChat && !hasResponses) return 'chat_completions';
+    return aiMode(fallback);
+  }
+  /* AI_ENDPOINT_PURE_END */
+
+  /* AI_EFFORT_MEMORY_BEGIN
+   * 推理档位记忆（AC4.3）：按 `${provider}::${origin}::${model}` 记忆用户选过的档位，
+   * LRU 上限 50 条；只存本机 localStorage，绝不写数据库与主进程配置。
+   */
+  function aiEffortKey(provider, baseUrl, model) {
+    return `${String(provider == null ? '' : provider)}::${aiOrigin(baseUrl)}::${String(model == null ? '' : model).trim()}`;
+  }
+  function aiEffortMemoryLoad() {
+    try {
+      const raw = localStorage.getItem(AI_EFFORT_MEMORY_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((x) => x && typeof x.k === 'string' && typeof x.v === 'string');
+    } catch {
+      return [];
+    }
+  }
+  function aiEffortMemorySave(list) {
+    try { localStorage.setItem(AI_EFFORT_MEMORY_KEY, JSON.stringify(list.slice(-AI_EFFORT_MEMORY_LIMIT))); } catch { /* 存储不可用时只影响记忆，不影响使用 */ }
+  }
+  /** 读取记忆（命中即刷新 LRU 顺序）；没有记录返回空串 */
+  function aiEffortMemoryGet(key) {
+    if (!key) return '';
+    const list = aiEffortMemoryLoad();
+    const i = list.findIndex((x) => x.k === key);
+    if (i < 0) return '';
+    const [hit] = list.splice(i, 1);
+    list.push(hit);
+    aiEffortMemorySave(list);
+    return hit.v;
+  }
+  /** 写入记忆（空串 = 删除该模型的记忆），超过 50 条淘汰最久未用的 */
+  function aiEffortMemorySet(key, value) {
+    if (!key) return;
+    const list = aiEffortMemoryLoad().filter((x) => x.k !== key);
+    if (value) list.push({ k: key, v: String(value) });
+    aiEffortMemorySave(list);
+  }
+  /* AI_EFFORT_MEMORY_END */
+
   function aiCfg() {
     const ai = (state && state.ai) || {};
-    if (aiDraft.provider === null) { aiDraft.provider = ai.provider || 'deepseek'; aiDraft.baseUrl = ai.baseUrl || ''; aiDraft.model = ai.model || ''; }
+    if (aiDraft.provider === null) {
+      aiDraft.provider = ai.provider || 'deepseek';
+      aiDraft.baseUrl = ai.baseUrl || '';
+      aiDraft.model = ai.model || '';
+      aiDraft.apiMode = aiMode(ai.apiMode);
+      aiDraft.reasoningEffort = typeof ai.reasoningEffort === 'string' ? ai.reasoningEffort : '';
+      // 已保存的档位作为该模型的初始记忆，避免首次渲染被 LRU 归零
+      if (aiDraft.reasoningEffort) {
+        aiEffortMemorySet(aiEffortKey(aiDraft.provider, aiDraft.baseUrl, aiDraft.model), aiDraft.reasoningEffort);
+      }
+    }
     const preset = PRESETS.find((x) => x.id === aiDraft.provider) || PRESETS[0];
     return { ai, preset };
   }
   function draftPayload(extra) {
     const { preset } = aiCfg();
-    const cfg = { provider: aiDraft.provider, baseUrl: aiDraft.baseUrl || preset.baseUrl, model: aiDraft.model || preset.model, ...extra };
+    const cfg = {
+      provider: aiDraft.provider, baseUrl: aiDraft.baseUrl || preset.baseUrl, model: aiDraft.model || preset.model,
+      apiMode: aiMode(aiDraft.apiMode), reasoningEffort: String(aiDraft.reasoningEffort || ''), ...extra,
+    };
     if (aiDraft.apiKey.trim()) cfg.apiKey = aiDraft.apiKey.trim();
     return cfg;
+  }
+
+  // ---------- 推理档位：胶囊行 / 折叠行 / 自定义直通 / 局部刷新（AC4.3） ----------
+  let aiEffortBox = null; // 独立子节点：打字时只 fill 它，不重建任何 <input>
+  let aiEffortHint = null;
+  let aiEffortCur = null;
+  let aiEffortInput = null;
+  let aiEffortSeq = 0; // 异步解析序号：模型快速切换时只认最后一次结果
+
+  function effortKeyFor(modelId) {
+    const { preset } = aiCfg();
+    return aiEffortKey(aiDraft.provider, aiDraft.baseUrl || preset.baseUrl, modelId || aiDraft.model || preset.model);
+  }
+  /** 从 [获取模型] 的本次结果里取档位：undefined = 列表里没有该模型，null = 明确未知 */
+  function modelEffortsFromList(modelId) {
+    const list = Array.isArray(aiDraft.models) ? aiDraft.models : [];
+    const hit = list.find((m) => m && String(m.id || '') === modelId);
+    if (!hit) return undefined;
+    return Array.isArray(hit.efforts) ? hit.efforts.slice() : null;
+  }
+  function rememberEffort() {
+    const id = String(aiDraft.model || '').trim();
+    if (!id) return;
+    aiEffortMemorySet(effortKeyFor(id), String(aiDraft.reasoningEffort || ''));
+  }
+  /** 恢复记忆：模型有原生档位而记忆值不在其中时归零，防止残留档位触发 400 */
+  function applyEffortMemory(key, efforts) {
+    const remembered = aiEffortMemoryGet(key);
+    // null = 未知（允许任意自定义字符串）；[] = 显式无档位（只接受默认空串）
+    const known = Array.isArray(efforts);
+    const native = known ? efforts.map((x) => String(x).toLowerCase()) : null;
+    aiDraft.reasoningEffort = remembered && (!known || native.includes(remembered.toLowerCase())) ? remembered : '';
+  }
+  const effortIsHigh = (value) => AI_HIGH_EFFORTS.includes(String(value || '').toLowerCase());
+  function syncEffortHint() {
+    if (aiEffortHint) aiEffortHint.classList.toggle('hidden', !effortIsHigh(aiDraft.reasoningEffort));
+  }
+  function effortPill(label, on, onclick) {
+    return h('button', { class: `tag-pill ${on ? 'on' : ''}`, type: 'button', 'aria-pressed': on ? 'true' : 'false', onclick }, label);
+  }
+  function effortCustomInput() {
+    const customIn = h('input', { class: 'ai-effort-input', type: 'text', placeholder: '输入任意档位字符串，留空为默认', autocomplete: 'off', spellcheck: 'false' });
+    customIn.value = String(aiDraft.reasoningEffort || '');
+    aiEffortInput = customIn;
+    customIn.addEventListener('input', () => {
+      aiDraft.reasoningEffort = customIn.value;
+      if (aiEffortCur) fill(aiEffortCur, customIn.value || '默认（不指定）');
+      syncEffortHint();
+    });
+    customIn.addEventListener('change', () => { aiDraft.reasoningEffort = customIn.value; rememberEffort(); syncEffortHint(); });
+    customIn.addEventListener('keydown', (e) => {
+      if (!e || e.key !== 'Enter') return;
+      aiDraft.reasoningEffort = customIn.value;
+      rememberEffort();
+      renderEffort();
+    });
+    return customIn;
+  }
+  /** 只重绘 #ai-effort 子节点；焦点在自定义输入框内时只更新提示行，绝不打断输入 */
+  function renderEffort() {
+    if (!aiEffortBox) return;
+    if (aiEffortBox.contains(document.activeElement) && document.activeElement.tagName === 'INPUT') { syncEffortHint(); return; }
+    const effort = String(aiDraft.reasoningEffort || '');
+    const efforts = Array.isArray(aiDraft.efforts) ? aiDraft.efforts : null;
+    const hasLevels = !!(efforts && efforts.length);
+    const hint = h('div', { class: `ai-effort-hint${effortIsHigh(effort) ? '' : ' hidden'}` }, '该档位后台耗时与 Token 消耗更多，可按需选择。');
+    aiEffortHint = hint;
+    aiEffortCur = null;
+    aiEffortInput = null;
+    const choose = (value) => {
+      aiDraft.reasoningEffort = value;
+      aiDraft.effortOpen = false;
+      rememberEffort();
+      renderEffort();
+    };
+    const rows = [];
+    if (hasLevels) {
+      const pills = [effortPill('默认', effort === '', () => choose(''))];
+      for (const level of efforts) {
+        const value = String(level);
+        pills.push(effortPill(value, effort.toLowerCase() === value.toLowerCase(), () => choose(value)));
+      }
+      const customOn = !!aiDraft.effortOpen;
+      pills.push(effortPill('自定义…', customOn, () => {
+        aiDraft.effortOpen = true;
+        renderEffort();
+        if (aiEffortInput) aiEffortInput.focus();
+      }));
+      rows.push(h('div', { class: 'ai-effort-line' },
+        h('span', { class: 'ai-effort-lbl' }, '推理档位'),
+        h('div', { class: 'ai-effort-pills' }, ...pills)));
+    } else {
+      const cur = h('span', { class: 'ai-effort-cur' }, effort || '默认（不指定）');
+      aiEffortCur = cur;
+      rows.push(h('div', { class: 'ai-effort-line' },
+        h('span', { class: 'ai-effort-lbl' }, '推理档位：'),
+        cur,
+        effortPill(aiDraft.effortOpen ? '自定义档位 ▴' : '自定义档位 ▾', false, () => {
+          aiDraft.effortOpen = !aiDraft.effortOpen;
+          renderEffort();
+          if (aiDraft.effortOpen && aiEffortInput) aiEffortInput.focus();
+        })));
+    }
+    if (aiDraft.effortOpen) rows.push(effortCustomInput());
+    rows.push(hint);
+    fill(aiEffortBox, ...rows);
+  }
+
+  /** 解析当前模型的原生档位（列表缓存 → 只读 IPC → 未知 null），并恢复该模型的记忆档位 */
+  async function syncEffortsFor(modelId) {
+    const { preset } = aiCfg();
+    const id = String(modelId || aiDraft.model || '').trim();
+    const key = aiEffortKey(aiDraft.provider, aiDraft.baseUrl || preset.baseUrl, id || preset.model);
+    const seq = ++aiEffortSeq;
+    if (!id) {
+      aiDraft.efforts = null; aiDraft.effortsModel = ''; aiDraft.effortsKey = '';
+      aiDraft.reasoningEffort = ''; aiDraft.effortOpen = false;
+      renderEffort();
+      return;
+    }
+    const cached = aiDraft.effortsCache.get(key);
+    let efforts;
+    if (cached !== undefined) {
+      efforts = cached;
+    } else {
+      const fromList = modelEffortsFromList(id);
+      if (fromList !== undefined) {
+        efforts = fromList;
+        aiDraft.effortsCache.set(key, efforts);
+      } else {
+        // 未命中缓存：先按「未知」折叠，绝不沿用上一个模型的档位
+        if (aiDraft.effortsModel !== id || aiDraft.effortsKey !== key) {
+          aiDraft.efforts = null; aiDraft.effortsModel = id; aiDraft.effortsKey = key;
+          aiDraft.reasoningEffort = ''; aiDraft.effortOpen = false;
+          renderEffort();
+        }
+        let r = null;
+        try { r = await mem0.resolveAiModelEfforts(draftPayload({}), id); } catch { r = null; }
+        if (seq !== aiEffortSeq) return;
+        efforts = r && r.ok === true && Array.isArray(r.efforts) ? r.efforts.slice() : null;
+        aiDraft.effortsCache.set(key, efforts);
+      }
+    }
+    if (seq !== aiEffortSeq) return;
+    aiDraft.efforts = efforts;
+    aiDraft.effortsModel = id;
+    aiDraft.effortsKey = key;
+    aiDraft.effortOpen = false;
+    applyEffortMemory(key, efforts);
+    renderEffort();
   }
 
   function renderSettingsAi() {
@@ -650,14 +946,109 @@
       h('div', { class: 'ds' }, '会话停更 5 分钟后，用你配置的轻量模型补标题、摘要和事项进展，排障结论自动存进「踩坑与经验库」。不会改动你手动改过的标题与归属，也不会写入个人背景、协作准则与环境三个分组。')),
       h('div', { class: 'end' }, sw));
     const pill = (x) => h('button', { class: `tag-pill ${aiDraft.provider === x.id ? 'on' : ''}`, type: 'button',
-      onclick: () => { aiDraft.provider = x.id; aiDraft.baseUrl = x.baseUrl; aiDraft.model = x.model; aiDraft.testMsg = ''; renderSettingsAi(); } }, x.label);
+      onclick: () => {
+        aiDraft.provider = x.id; aiDraft.baseUrl = x.baseUrl; aiDraft.model = x.model; aiDraft.testMsg = '';
+        aiDraft.apiMode = aiModeForPreset(x.id, aiDraft.apiMode); // DeepSeek / Gemini Flash / 本地 Ollama 切回 chat_completions
+        aiDraft.models = null; aiDraft.modelFilter = '';
+        renderSettingsAi();
+      } }, x.label);
     const urlIn = input(aiDraft.baseUrl || preset.baseUrl, preset.baseUrl);
     const modelIn = input(aiDraft.model || preset.model, preset.model);
-    const keyIn = h('input', { type: aiDraft.showKey ? 'text' : 'password', placeholder: !preset.needKey ? '本地模型无需 Key' : ai.hasKey ? `已保存 ${ai.keyHint || ''}，留空则沿用` : '粘贴 API Key（只加密保存在本机）', autocomplete: 'off', spellcheck: 'false' });
+    const keyIn = h('input', { type: aiDraft.showKey ? 'text' : 'password', autocomplete: 'off', spellcheck: 'false' });
     keyIn.value = aiDraft.apiKey; keyIn.disabled = !preset.needKey;
-    urlIn.addEventListener('input', () => { aiDraft.baseUrl = urlIn.value.trim(); });
-    modelIn.addEventListener('input', () => { aiDraft.model = modelIn.value.trim(); });
+    // 协议胶囊 + URL 预览：独立子节点，打字只更新它们，不重建 <input>（AC2.4）
+    const modePill = (m, label) => h('button', { class: 'tag-pill', type: 'button', 'aria-pressed': 'false',
+      onclick: () => { aiDraft.apiMode = aiMode(m, aiDraft.apiMode); syncDerived(); } }, label);
+    const modePills = { chat_completions: modePill('chat_completions', 'Chat Completions'), responses: modePill('responses', 'Responses') };
+    const modeRow = h('div', { class: 'ai-mode-pills', id: 'ai-mode-pills', role: 'group', 'aria-label': '接口协议' },
+      modePills.chat_completions, modePills.responses);
+    const urlPreview = h('div', { class: 'ai-url-preview', id: 'ai-url-preview' });
+    urlIn.setAttribute('id', 'ai-base-url'); modelIn.setAttribute('id', 'ai-model-name');
+    const urlField = h('div', { class: 'field ai-url-field' },
+      h('div', { class: 'ai-url-hd' }, h('label', { for: 'ai-base-url' }, '接口地址'), modeRow), urlIn, urlPreview);
+    // [获取模型]：现有 .pop.menu 浮层承载完整列表，支持输入过滤与自由手输（禁用原生 datalist）
+    const modelFilter = h('input', { type: 'text', placeholder: '输入关键字过滤模型', autocomplete: 'off', spellcheck: 'false' });
+    modelFilter.value = aiDraft.modelFilter;
+    const modelList = h('div', { class: 'ai-model-list' });
+    const modelPop = h('div', { class: 'pop menu ai-model-pop', role: 'listbox', 'aria-label': '模型列表' },
+      h('div', { class: 'pop-inline-input' }, modelFilter), modelList);
+    const fetchBtn = h('button', { class: 'btn ai-fetch-btn', type: 'button', disabled: aiDraft.modelsLoading }, aiDraft.modelsLoading ? '获取中…' : '获取模型');
+    const modelWrap = h('div', { class: 'ai-model-wrap' }, modelIn, fetchBtn, modelPop);
+    const modelCtl = popover(modelWrap, modelPop);
+    const pickModel = (m) => {
+      const id = String((m && m.id) || '').trim();
+      if (!id) return;
+      aiDraft.model = id; modelIn.value = id;
+      aiDraft.apiMode = aiModeFromModelTypes(m && m.endpointTypes, aiDraft.apiMode); // 端点类型反推，未返回类型不猜
+      modelCtl.close();
+      syncDerived();
+      syncEffortsFor(id); // 切模型：恢复该模型记忆档位，不支持则归零
+    };
+    const renderModelList = () => {
+      const q = String(aiDraft.modelFilter || '').trim().toLowerCase();
+      const all = Array.isArray(aiDraft.models) ? aiDraft.models : [];
+      const rows = (q ? all.filter((m) => String((m && m.id) || '').toLowerCase().includes(q)) : all).slice(0, 300);
+      if (!rows.length) {
+        fill(modelList, h('div', { class: 'ai-model-empty' }, all.length ? '没有匹配的模型' : '还没有模型列表，点「获取模型」拉取'));
+        return;
+      }
+      fill(modelList, ...rows.map((m) => {
+        const on = m.id === (aiDraft.model || preset.model);
+        return h('button', { class: `mi ${on ? 'on' : ''}`, type: 'button', title: m.id, onclick: () => pickModel(m) },
+          h('span', { class: 'ck' }, on ? icon('check') : null),
+          h('span', { class: 'mi-main' }, h('span', { class: 'src-name' }, m.id)));
+      }));
+    };
+    /** Key 输入框 placeholder：草稿域名与已保存域名不同则提示重新输入（AC3.2 前端部分） */
+    const keyPlaceholder = () => {
+      if (!preset.needKey) return '本地模型无需 Key';
+      const draftOrigin = aiOrigin(aiDraft.baseUrl || preset.baseUrl);
+      const savedOrigin = aiOrigin(ai.baseUrl);
+      const changed = Boolean(draftOrigin && savedOrigin && draftOrigin !== savedOrigin);
+      if (ai.hasKey && changed) return '接口域名已变更，请输入对应 API Key';
+      return ai.hasKey ? `已保存 ${ai.keyHint || ''}，留空则沿用` : '粘贴 API Key（只加密保存在本机）';
+    };
+    /** 局部刷新协议胶囊 / URL 预览 / Key placeholder（打字路径上不重建任何 <input>） */
+    const syncDerived = () => {
+      const mode = aiMode(aiDraft.apiMode);
+      aiDraft.apiMode = mode;
+      for (const [k, b] of Object.entries(modePills)) {
+        const on = k === mode;
+        b.classList.toggle('on', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      }
+      const url = aiEndpointUrl(aiDraft.baseUrl || preset.baseUrl, mode);
+      urlPreview.textContent = url || '接口地址无效，请填写 http(s) 开头的完整地址';
+      urlPreview.setAttribute('title', url || '');
+      keyIn.placeholder = keyPlaceholder();
+    };
+    urlIn.addEventListener('input', () => {
+      aiDraft.baseUrl = urlIn.value.trim();
+      aiDraft.apiMode = aiModeFromUrl(aiDraft.baseUrl, aiDraft.apiMode); // 输入地址时自动对齐协议
+      syncDerived();
+    });
+    modelIn.addEventListener('input', () => {
+      aiDraft.model = modelIn.value.trim();
+      syncEffortsFor(aiDraft.model); // 手输模型同样按记忆恢复或归零
+    });
     keyIn.addEventListener('input', () => { aiDraft.apiKey = keyIn.value; });
+    modelFilter.addEventListener('input', () => { aiDraft.modelFilter = modelFilter.value; renderModelList(); });
+    fetchBtn.addEventListener('click', async () => {
+      if (aiDraft.modelsLoading) return;
+      aiDraft.modelsLoading = true; fetchBtn.disabled = true; fetchBtn.textContent = '获取中…';
+      let r = null;
+      try { r = await mem0.fetchAiModels(draftPayload({})); } catch (e) { r = { ok: false, error: (e && e.message) || String(e) }; }
+      aiDraft.modelsLoading = false; fetchBtn.disabled = false; fetchBtn.textContent = '获取模型';
+      if (!r || r.ok !== true) { toast(`获取模型失败：${(r && r.error) || '未知错误'}`); return; }
+      // 只读结果：地址推导在前，/models 的 supported_endpoint_types 反推在后（AC2.3）
+      aiDraft.models = (Array.isArray(r.models) ? r.models : []).filter((m) => m && String(m.id || '').trim());
+      aiDraft.apiMode = aiMode(r.apiMode, aiDraft.apiMode);
+      syncDerived(); renderModelList(); modelCtl.open(); modelFilter.focus();
+      syncEffortsFor(aiDraft.model || preset.model); // 列表自带档位优先，避免再发只读探测
+      toast(`已获取 ${aiDraft.models.length} 个模型`);
+    });
+    syncDerived(); // 首帧即回显最终请求 URL 与当前协议胶囊
+    renderModelList();
     const eye = h('button', { class: 'ai-eye-btn', type: 'button', onclick: () => { aiDraft.showKey = !aiDraft.showKey; keyIn.type = aiDraft.showKey ? 'text' : 'password'; eye.textContent = aiDraft.showKey ? '隐藏' : '显示'; } }, aiDraft.showKey ? '隐藏' : '显示');
     const testBtn = h('button', { class: 'btn ai-test-btn', type: 'button', disabled: aiDraft.testing }, aiDraft.testing ? '测试中…' : '测试并保存');
     testBtn.addEventListener('click', async () => {
@@ -671,9 +1062,13 @@
       }
       renderSettingsAi();
     });
+    // 推理档位：独立子节点，打字 / 切档只 fill 这里，不重建任何 <input>（AC4.3）
+    const effortBox = h('div', { class: 'ai-effort', id: 'ai-effort' });
+    aiEffortBox = effortBox;
     const cfgBox = h('div', { class: 'ai-cfg-box' },
       h('div', { class: 'ai-preset-row' }, h('span', { class: 'ai-preset-lbl' }, '模型服务'), ...PRESETS.map(pill)),
-      h('div', { class: 'edit-row2' }, field('接口地址', urlIn), field('模型', modelIn)),
+      h('div', { class: 'edit-row2' }, urlField, h('div', { class: 'field ai-model-field' }, h('label', { for: 'ai-model-name' }, '模型'), modelWrap)),
+      effortBox,
       h('div', { class: 'ai-key-row' }, h('label', { class: 'field ai-key-field' }, h('span', {}, 'API Key'), h('div', { class: 'ai-key-wrap' }, keyIn, preset.needKey ? eye : null)), testBtn),
       aiDraft.testMsg ? h('div', { class: 'sub' }, aiDraft.testMsg) : null,
       ai.hasKey && preset.needKey ? h('div', { class: 'sub' }, btn('text-btn', '清除已保存的 Key', async () => { const s = await guarded(() => mem0.saveAiConfig(draftPayload({ clearKey: true })), '已清除 Key'); setState(s); })) : null);
@@ -696,6 +1091,7 @@
       h('div', { class: 'grow-main' }, h('div', { class: 'nm' }, '历史旧会话'), h('div', { class: 'ds', 'data-unorganized': String(n) }, oldDesc)),
       h('div', { class: 'end' }, oldBtn));
     fill(box, head, cfgBox, old);
+    syncEffortsFor(aiDraft.model || preset.model); // 首帧解析档位并按记忆恢复
   }
 
   async function packAction(fn, okMsg) {
@@ -729,6 +1125,8 @@
     renderMemory,
     renderAll: renderExtAll,
     openMemory,
+    /** 推理档位记忆（AC4.3）：供单测校验 LRU 上限与键格式，不参与业务渲染 */
+    effortMemory: { key: aiEffortKey, get: aiEffortMemoryGet, set: aiEffortMemorySet, limit: AI_EFFORT_MEMORY_LIMIT },
   };
   if (state) renderExtAll();
 })();

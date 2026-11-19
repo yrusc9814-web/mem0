@@ -762,10 +762,58 @@ $('#btn-copy-mcp-url').addEventListener('click', async (e) => {
 })();
 
 // ---------- 设置 ----------
+/** 轻提示：沿用记忆页 .toast 样式（设置页在 memory.js 闭包之外，这里单独实现一份） */
+let toastTimer = null;
+function toast(msg) {
+  const old = document.querySelector('.toast');
+  if (old) old.remove();
+  clearTimeout(toastTimer);
+  const el = h('div', { class: 'toast', role: 'status' }, h('span', {}, msg));
+  document.body.append(el);
+  toastTimer = setTimeout(() => el.remove(), 2200);
+}
+
+// 开机自动启动（AC1.4）：仅 Windows（state.autoLaunch.supported === true）渲染，非 Windows 完全不渲染该行
+const AUTOLAUNCH_DESC = '开机后静默驻留托盘，自动备份对话并运行本地 MCP 服务';
+let autoLaunchRow = null;
+let autoLaunchInput = null;
+function renderAutoLaunch() {
+  const al = (state && state.autoLaunch) || {};
+  const supported = al.supported === true;
+  const hd = $('#settings-appearance-hd');
+  if (hd) hd.textContent = supported ? '常规与外观' : '外观';
+  const box = $('#settings-appearance');
+  if (!box) return;
+  if (!supported) {
+    if (autoLaunchRow) { autoLaunchRow.remove(); autoLaunchRow = null; autoLaunchInput = null; }
+    return;
+  }
+  if (!autoLaunchRow) {
+    const sw = toggle(!!al.enabled, setAutoLaunch, '开机自动启动'); // 复用连接页的 .switch 开关
+    autoLaunchInput = sw.children[0]; // toggle() 内的 <input type="checkbox">
+    autoLaunchRow = h('div', { class: 'grow', id: 'autolaunch-row' },
+      h('div', { class: 'grow-main' }, h('div', { class: 'nm' }, '开机自动启动'), h('div', { class: 'ds' }, AUTOLAUNCH_DESC)),
+      h('div', { class: 'end' }, sw));
+    box.insertBefore(autoLaunchRow, box.firstChild); // 同卡片内「主题」上方
+  }
+  autoLaunchInput.checked = !!al.enabled; // 只改勾选状态不重建节点：后台状态推送时不打断点击
+}
+/** 切换开机自启动：失败时开关回弹到后端最终状态，并 toast 后端返回的原因 */
+async function setAutoLaunch(on) {
+  let r = null;
+  try { r = await mem0.setAutoLaunch(!!on); } catch (e) { toast(`设置失败：${(e && e.message) || e}`); }
+  if (r && typeof r === 'object') {
+    state = { ...state, autoLaunch: { supported: r.supported === true, enabled: r.enabled === true } };
+    if (!r.ok) toast(r.reason || '设置失败，请稍后重试');
+  }
+  renderAutoLaunch();
+}
+
 function renderSettings() {
   $('#datadir').textContent = state.dataDir;
   $('#bridge-url').textContent = state.services.bridge.url || state.services.bridge.error || (state.services.bridge.starting ? '启动中' : '未启动');
   $('#version').textContent = `mem0 ${state.version} · 所有数据只保存在本机`;
+  renderAutoLaunch();
 }
 $('#btn-datadir').addEventListener('click', () => mem0.openDataDir());
 $('#btn-datadir-change').addEventListener('click', async (e) => {

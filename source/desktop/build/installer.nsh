@@ -4,3 +4,9 @@
   nsExec::Exec `taskkill /F /IM mem0.exe /T`
   Pop $0
 !macroend
+
+; 卸载时清掉开机自启动登记，避免残留（Electron 写入的 Run 值，appId / productName 两种键名）
+!macro customUnInstall
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "electron.app.mem0"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "dev.mem0.desktop"
+!macroend

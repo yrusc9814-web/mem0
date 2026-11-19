@@ -2865,12 +2865,14 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       const org = new AiOrganizer({ store });
       const s = org.getPublicState();
       assert.deepEqual(Object.keys(s), [
-        'enabled', 'provider', 'baseUrl', 'model', 'hasKey', 'keyHint',
+        'enabled', 'provider', 'baseUrl', 'apiMode', 'reasoningEffort', 'model', 'hasKey', 'keyHint',
         'statusText', 'statusOk', 'unorganizedCount', 'organizing',
       ]);
       assert.equal(s.enabled, false);
       assert.equal(s.provider, 'deepseek');
       assert.equal(s.baseUrl, 'https://api.deepseek.com/v1');
+      assert.equal(s.apiMode, 'chat_completions');
+      assert.equal(s.reasoningEffort, '', '默认不传档位：空串与 none 严格区分');
       assert.equal(s.model, 'deepseek-chat');
       assert.equal(s.hasKey, false);
       assert.equal(s.keyHint, '');
@@ -2890,6 +2892,12 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       assert.equal(org2.getPublicState().provider, 'gemini');
       assert.equal(org2.getPublicState().hasKey, true);
       assert.equal(org2.getApiKey(), key);
+
+      // apiMode 落盘并跨实例恢复（AC2.1）
+      org.saveConfig({ apiMode: 'responses' });
+      assert.equal(org.getPublicState().apiMode, 'responses');
+      const org3 = new AiOrganizer({ store });
+      assert.equal(org3.getPublicState().apiMode, 'responses');
       store.close();
     });
 
@@ -3016,6 +3024,704 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
   }
 
   // =====================================================================
+  // 2g2. T3：双协议 URL 规范化 / 智能对齐 / 只读获取模型 / 防旧 Key 跨站（AC2.2 / AC3.1 / AC3.2）
+  // =====================================================================
+  {
+    const {
+      buildEndpoint, buildModelsUrl, normalizeOrigin, normalizeApiMode,
+      apiModeFromBaseUrl, apiModeFromEndpointTypes, apiModeForPreset, alignApiMode,
+      resolveChatCompletionsUrl, DEFAULT_API_MODE, AiOrganizer,
+    } = require(path.join(ROOT, 'src/main/ai-organizer'));
+
+    await t('2g2 URL', 'buildEndpoint：裸域名 / 已有路径 / 尾部 # 锁定 / ?api-version= 不重复拼路径', () => {
+      const cases = [
+        ['https://api.deepseek.com', 'chat_completions', 'https://api.deepseek.com/v1/chat/completions'],
+        ['https://api.deepseek.com', 'responses', 'https://api.deepseek.com/v1/responses'],
+        [' https://host/v1/ ', 'responses', 'https://host/v1/responses'],
+        ['https://host/v1', 'chat_completions', 'https://host/v1/chat/completions'],
+        ['http://127.0.0.1:11434', 'chat_completions', 'http://127.0.0.1:11434/v1/chat/completions'],
+        // 末尾 # 锁定：裸域名禁补 /v1，直接拼协议后缀
+        ['https://host#', 'chat_completions', 'https://host/chat/completions'],
+        ['https://host#', 'responses', 'https://host/responses'],
+        // 末尾 # 锁定：已有非根路径 100% 原样锁定（切协议也不追加后缀）
+        ['https://host/custom/endpoint#', 'chat_completions', 'https://host/custom/endpoint'],
+        ['https://host/custom/endpoint#', 'responses', 'https://host/custom/endpoint'],
+        ['https://host/v1/chat/completions#', 'responses', 'https://host/v1/chat/completions'],
+        // 无 #：已有 /chat/completions 或 /responses 结尾先剥离再补当前协议后缀
+        ['https://host/v1/chat/completions', 'responses', 'https://host/v1/responses'],
+        ['https://host/v1/responses', 'chat_completions', 'https://host/v1/chat/completions'],
+        ['https://host/v1/chat/completions/', 'chat_completions', 'https://host/v1/chat/completions'],
+        // ?api-version= 查询串：保留且不重复拼 /chat/completions
+        ['https://host/openai/deployments/d/chat/completions?api-version=2024-02-01', 'chat_completions',
+          'https://host/openai/deployments/d/chat/completions?api-version=2024-02-01'],
+        ['https://host/openai/deployments/d?api-version=2024-02-01', 'chat_completions',
+          'https://host/openai/deployments/d/chat/completions?api-version=2024-02-01'],
+        ['https://host/openai/deployments/d?api-version=2024-02-01', 'responses',
+          'https://host/openai/deployments/d/responses?api-version=2024-02-01'],
+        // 非法模式回退 chat_completions；非法地址返回空串
+        ['https://host', 'bogus', 'https://host/v1/chat/completions'],
+        ['', 'chat_completions', ''],
+        ['ftp://host/v1', 'chat_completions', ''],
+        ['not a url', 'responses', ''],
+      ];
+      for (const [input, mode, expected] of cases) {
+        assert.equal(buildEndpoint(input, mode), expected, `${input} @ ${mode}`);
+      }
+      // 旧导出保留且与 buildEndpoint 等价
+      assert.equal(resolveChatCompletionsUrl('https://host/v1'), buildEndpoint('https://host/v1', 'chat_completions'));
+      assert.equal(normalizeApiMode('bogus'), DEFAULT_API_MODE);
+      assert.equal(normalizeApiMode('responses'), 'responses');
+    });
+
+    await t('2g2 URL', 'buildModelsUrl：基于同一 pathname 推导 /models；末尾 # 的裸域名不补 /v1，无 # 的裸域名补 /v1/models', () => {
+      const cases = [
+        ['https://host', 'https://host/v1/models'],
+        ['https://host/v1', 'https://host/v1/models'],
+        // 末尾 # 锁定与协议后缀一致：裸域名禁补 /v1
+        ['https://host#', 'https://host/models'],
+        ['https://host/#', 'https://host/models'],
+        ['https://host/?api-version=1#', 'https://host/models?api-version=1'],
+        // 已有非根路径：锁定 / 非锁定都按同一 pathname 推导
+        ['https://host/v1/chat/completions', 'https://host/v1/models'],
+        ['https://host/v1/responses?api-version=1', 'https://host/v1/models?api-version=1'],
+        ['https://host/custom/endpoint#', 'https://host/custom/endpoint/models'],
+        ['https://generativelanguage.googleapis.com/v1beta/openai', 'https://generativelanguage.googleapis.com/v1beta/openai/models'],
+        ['', ''],
+        ['not a url', ''],
+      ];
+      for (const [input, expected] of cases) assert.equal(buildModelsUrl(input), expected, input);
+      // 锁定（#）与否只影响「裸域名是否补 /v1」，两者共用同一 pathname
+      assert.equal(buildModelsUrl('https://host#'), 'https://host/models');
+      assert.equal(buildModelsUrl('https://host'), 'https://host/v1/models');
+    });
+
+    await t('2g2 URL', '渲染层接口地址纯函数与主进程同规则（AI_ENDPOINT_PURE 区块逐条对照）', () => {
+      const vm = require('node:vm');
+      const src = fs.readFileSync(path.join(ROOT, 'src/renderer/memory.js'), 'utf8');
+      const block = /\/\* AI_ENDPOINT_PURE_BEGIN[\s\S]*?\/\* AI_ENDPOINT_PURE_END \*\//.exec(src);
+      assert.ok(block, 'memory.js 应保留 AI_ENDPOINT_PURE_BEGIN / END 纯函数区块标记');
+      const ui = vm.runInNewContext(
+        `${block[0]}\n;({ aiEndpointUrl, aiModeFromUrl, aiModeForPreset, aiModeFromModelTypes, aiOrigin })`,
+        { URL }, { filename: 'memory-ai-endpoint.js' },
+      );
+      const urls = [
+        'https://api.deepseek.com', 'https://api.deepseek.com/v1', 'http://127.0.0.1:11434',
+        'https://host/v1/', 'https://host#', 'https://host/#', 'https://host/v1/chat/completions#',
+        'https://host/custom/endpoint#', 'https://host/v1/chat/completions', 'https://host/v1/responses',
+        'https://host/openai/deployments/d?api-version=2024-02-01',
+        'https://host/openai/deployments/d/chat/completions?api-version=2024-02-01',
+        'https://generativelanguage.googleapis.com/v1beta/openai', '', '   ', 'not a url', 'ftp://host/v1',
+      ];
+      for (const url of urls) {
+        for (const mode of ['chat_completions', 'responses']) {
+          assert.equal(ui.aiEndpointUrl(url, mode), buildEndpoint(url, mode), `${url} @ ${mode}`);
+          assert.equal(ui.aiModeFromUrl(url, mode), apiModeFromBaseUrl(url, mode), `对齐 ${url} @ ${mode}`);
+        }
+        assert.equal(ui.aiOrigin(url), normalizeOrigin(url), `同源 ${url}`);
+      }
+      for (const types of [[], ['openai'], ['openai-response'], ['openai', 'openai-response'], ['bogus']]) {
+        for (const mode of ['chat_completions', 'responses']) {
+          assert.equal(ui.aiModeFromModelTypes(types, mode), apiModeFromEndpointTypes(types, mode), `${types} @ ${mode}`);
+        }
+      }
+      for (const id of ['deepseek', 'gemini', 'ollama', 'openai', '']) {
+        assert.equal(ui.aiModeForPreset(id, 'responses'), apiModeForPreset(id, 'responses'), id);
+        assert.equal(ui.aiModeForPreset(id, 'chat_completions'), apiModeForPreset(id, 'chat_completions'), id);
+      }
+    });
+
+    await t('2g2 同源', 'normalizeOrigin：协议 + 主机 + 端口归一，非法地址返回空串', () => {
+      assert.equal(normalizeOrigin('https://API.Example.com/v1'), 'https://api.example.com');
+      assert.equal(normalizeOrigin('https://api.example.com:443/v1'), 'https://api.example.com');
+      assert.equal(normalizeOrigin('http://api.example.com:80/v1'), 'http://api.example.com');
+      assert.equal(normalizeOrigin('http://127.0.0.1:11434/v1'), 'http://127.0.0.1:11434');
+      assert.equal(normalizeOrigin('https://api.example.com#'), 'https://api.example.com');
+      assert.notEqual(normalizeOrigin('https://api.example.com/v1'), normalizeOrigin('https://api.example.com:8443/v1'));
+      for (const bad of ['', '   ', '://bad', 'ftp://api.example.com', 'not a url']) {
+        assert.equal(normalizeOrigin(bad), '', bad);
+      }
+    });
+
+    await t('2g2 对齐', '双向智能对齐：URL 后缀 / supported_endpoint_types / 预设胶囊，未返回端点类型不盲切', () => {
+      assert.equal(apiModeFromBaseUrl('https://h/v1/responses', 'chat_completions'), 'responses');
+      assert.equal(apiModeFromBaseUrl('https://h/v1/chat/completions', 'responses'), 'chat_completions');
+      assert.equal(apiModeFromBaseUrl('https://h/v1', 'responses'), 'responses', '无后缀保持当前模式');
+      assert.equal(apiModeFromBaseUrl('https://h/v1/responses?x=1', 'chat_completions'), 'responses');
+
+      assert.equal(apiModeFromEndpointTypes(['openai-response'], 'chat_completions'), 'responses');
+      assert.equal(apiModeFromEndpointTypes(['openai'], 'responses'), 'chat_completions');
+      assert.equal(apiModeFromEndpointTypes(['openai', 'openai-response'], 'responses'), 'responses', '两种都支持时不盲切');
+      assert.equal(apiModeFromEndpointTypes([], 'responses'), 'responses', '未返回端点类型时保持原模式');
+      assert.equal(apiModeFromEndpointTypes([], 'chat_completions'), 'chat_completions');
+
+      for (const id of ['deepseek', 'gemini', 'ollama']) {
+        assert.equal(apiModeForPreset(id, 'responses'), 'chat_completions', id);
+      }
+      assert.equal(apiModeForPreset('openai', 'responses'), 'responses', 'OpenAI 兼容 / 中转不强制切换');
+
+      assert.equal(alignApiMode({ provider: 'ollama', presetTouched: true, currentMode: 'responses' }), 'chat_completions');
+      assert.equal(alignApiMode({ baseUrl: 'https://relay.test/v1', currentMode: 'responses' }), 'responses', '第三方中转不按模型名盲切');
+      assert.equal(alignApiMode({ baseUrl: 'https://relay.test/v1', endpointTypes: ['openai'], currentMode: 'responses' }), 'chat_completions');
+      assert.equal(alignApiMode({ baseUrl: 'https://relay.test/v1/responses', currentMode: 'chat_completions' }), 'responses');
+    });
+
+    await t('2g2 对齐', 'saveConfig：默认 chat_completions，按 URL 后缀与预设胶囊自动对齐并落盘', () => {
+      const store = freshStore();
+      const org = new AiOrganizer({ store });
+      assert.equal(org.getPublicState().apiMode, 'chat_completions');
+
+      org.saveConfig({ baseUrl: 'https://relay.test/v1/responses' });
+      assert.equal(org.getPublicState().apiMode, 'responses');
+      org.saveConfig({ baseUrl: 'https://relay.test/v1/chat/completions' });
+      assert.equal(org.getPublicState().apiMode, 'chat_completions');
+      org.saveConfig({ apiMode: 'responses' });
+      assert.equal(org.getPublicState().apiMode, 'responses');
+      // 预设胶囊（DeepSeek / Gemini Flash / 本地 Ollama）切回 chat_completions
+      for (const id of ['deepseek', 'gemini', 'ollama']) {
+        org.saveConfig({ apiMode: 'responses' });
+        org.saveConfig({ provider: id });
+        assert.equal(org.getPublicState().apiMode, 'chat_completions', id);
+      }
+      store.close();
+    });
+
+    // -------- 本地 Mock：/models 只认 Bearer，POST 探针恒成功 --------
+    const startMock = () => new Promise((resolve, reject) => {
+      const seen = [];
+      const server = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+          let parsed = null;
+          try { parsed = JSON.parse(body); } catch { parsed = null; }
+          seen.push({ method: req.method, url: req.url, headers: req.headers, body: parsed });
+          const headers = { 'Content-Type': 'application/json', Connection: 'close' };
+          const isModels = req.method === 'GET' && /\/models$/.test(req.url.split('?')[0]);
+          if (isModels) {
+            if (!req.headers.authorization) {
+              res.writeHead(401, headers);
+              res.end(JSON.stringify({ error: { message: 'no api key' } }));
+              return;
+            }
+            const responsesOnly = req.url.startsWith('/resp');
+            const data = responsesOnly
+              ? [{ id: 'resp-model', object: 'model', supported_endpoint_types: ['openai-response'] }]
+              : [{ id: 'mock-chat', object: 'model', supported_endpoint_types: ['openai'] }, { id: 'mock-reasoner', object: 'model' }];
+            res.writeHead(200, headers);
+            res.end(JSON.stringify({ object: 'list', data }));
+            return;
+          }
+          if (req.method === 'POST') {
+            res.writeHead(200, headers);
+            res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'OK' } }] }));
+            return;
+          }
+          res.writeHead(404, headers);
+          res.end('{}');
+        });
+      });
+      server.on('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        const port = server.address().port;
+        resolve({ server, seen, originBase: `http://127.0.0.1:${port}`, base: `http://127.0.0.1:${port}/v1` });
+      });
+    });
+    const mockA = await startMock();
+    const mockB = await startMock();
+    const lastSeen = (m) => m.seen[m.seen.length - 1];
+    // AC4.1 起 fetchAiModels 会对回环地址追加 POST /api/show 探测，取模型列表请求必须过滤而不是取「最后一条」
+    const lastModelsReq = (m) => [...m.seen].reverse().find((s) => s.method === 'GET' && /\/models$/.test(s.url.split('?')[0]));
+
+    await t('2g2 模型', 'fetchAiModels 只读：返回 id / endpointTypes / raw，不调用 saveConfig 污染运行态', async () => {
+      const store = freshStore();
+      const org = new AiOrganizer({ store });
+      org.saveConfig({ provider: 'openai', baseUrl: mockA.base, model: 'mock-model', apiKey: 'key-A-1234567890', enabled: true });
+      const before = org.getPublicState();
+
+      const r = await org.fetchAiModels({ provider: 'openai', baseUrl: mockA.base });
+      assert.equal(r.ok, true);
+      assert.equal(r.error, '');
+      assert.equal(r.modelsUrl, `${mockA.base}/models`);
+      assert.equal(r.baseUrl, mockA.base);
+      assert.equal(r.count, 2);
+      assert.deepEqual(r.models.map((m) => m.id), ['mock-chat', 'mock-reasoner']);
+      assert.deepEqual(r.models[0].endpointTypes, ['openai']);
+      assert.deepEqual(r.models[1].endpointTypes, []);
+      assert.equal(r.models[0].raw.object, 'model', '保留原始元数据供后续档位识别');
+      assert.equal(r.apiMode, 'chat_completions', '仅 openai 端点类型 → chat_completions');
+      assert.equal(lastModelsReq(mockA).method, 'GET');
+      assert.equal(lastModelsReq(mockA).url, '/v1/models');
+      assert.equal(lastModelsReq(mockA).headers.authorization, 'Bearer key-A-1234567890', '同源复用库内 Key');
+
+      // 只读：配置与密钥完全不变
+      const after = org.getPublicState();
+      assert.deepEqual(after, before);
+      assert.equal(org.getApiKey(), 'key-A-1234567890');
+      assert.equal(lastModelsReq(mockA).body, null, 'GET 不带请求体');
+      store.close();
+    });
+
+    await t('2g2 模型', 'fetchAiModels：/models 仅含 openai-response 时反推 responses，传递给后续档位识别', async () => {
+      const store = freshStore();
+      const org = new AiOrganizer({ store });
+      org.saveConfig({ provider: 'openai', baseUrl: `${mockA.originBase}/resp/v1`, model: 'm', apiKey: 'key-R-1234567890' });
+      const r = await org.fetchAiModels({ baseUrl: `${mockA.originBase}/resp/v1` });
+      assert.equal(r.ok, true);
+      assert.deepEqual(r.models.map((m) => m.id), ['resp-model']);
+      assert.deepEqual(r.models[0].endpointTypes, ['openai-response']);
+      assert.equal(r.modelsUrl, `${mockA.originBase}/resp/v1/models`);
+      assert.equal(r.apiMode, 'responses');
+      store.close();
+    });
+
+    await t('2g2 密钥', 'fetchAiModels：草稿 key 为空且域名变化时不复用旧 Key，显式新 Key 才发送', async () => {
+      const store = freshStore();
+      const org = new AiOrganizer({ store });
+      org.saveConfig({ provider: 'openai', baseUrl: mockA.base, model: 'm', apiKey: 'key-A-1234567890', enabled: true });
+      const before = org.getPublicState();
+
+      const cross = await org.fetchAiModels({ provider: 'openai', baseUrl: mockB.base });
+      assert.equal(cross.ok, false, '新域名没有旧 Key，Mock 返回 401');
+      assert.match(cross.error, /401/);
+      assert.equal(lastModelsReq(mockB).headers.authorization, undefined, '绝不复用旧域名 Key');
+      assert.deepEqual(org.getPublicState(), before, '只读调用不得改动配置 / 密钥');
+
+      const explicit = await org.fetchAiModels({ provider: 'openai', baseUrl: mockB.base, apiKey: 'key-B-1234567890' });
+      assert.equal(explicit.ok, true);
+      assert.equal(lastModelsReq(mockB).headers.authorization, 'Bearer key-B-1234567890');
+      assert.equal(org.getApiKey(), 'key-A-1234567890', '草稿 Key 绝不落盘');
+      assert.equal(org.getPublicState().baseUrl, mockA.base);
+      store.close();
+    });
+
+    await t('2g2 密钥', 'saveConfig / testConfig：域名变更且未显式新 Key 时不把旧域名 Key 发往新域名', async () => {
+      const store = freshStore();
+      const org = new AiOrganizer({ store });
+      org.saveConfig({ provider: 'openai', baseUrl: mockA.base, model: 'm', apiKey: 'key-A-1234567890', enabled: true });
+      assert.equal(org.getPublicState().hasKey, true);
+
+      // 同域名改路径：仍复用旧 Key
+      await org.testConfig({ baseUrl: mockA.base });
+      assert.equal(lastSeen(mockA).headers.authorization, 'Bearer key-A-1234567890');
+
+      // 域名变更 + 空 Key：库内旧 Key 被清空，探针不带 Authorization
+      const afterSwitch = org.saveConfig({ baseUrl: mockB.base });
+      assert.equal(afterSwitch.hasKey, false, '域名变更后不得继续持有旧域名 Key');
+      assert.equal(org.getApiKey(), '');
+      await org.testConfig({});
+      assert.equal(lastSeen(mockB).headers.authorization, undefined);
+
+      // 掩码占位 + 域名变更：同样不复用
+      org.saveConfig({ baseUrl: mockB.base, apiKey: 'key-B-1234567890' });
+      assert.equal(org.getPublicState().hasKey, true);
+      const masked = org.saveConfig({ baseUrl: mockA.base, apiKey: 'sk-••••3456' });
+      assert.equal(masked.hasKey, false);
+      await org.testConfig({});
+      assert.equal(lastSeen(mockA).headers.authorization, undefined);
+
+      // 显式新 Key：正常保存并使用
+      org.saveConfig({ baseUrl: mockA.base, apiKey: 'key-A2-1234567890' });
+      await org.testConfig({});
+      assert.equal(lastSeen(mockA).headers.authorization, 'Bearer key-A2-1234567890');
+      store.close();
+    });
+
+    for (const m of [mockA, mockB]) {
+      await new Promise((resolve) => {
+        m.server.close(resolve);
+        if (typeof m.server.closeAllConnections === 'function') m.server.closeAllConnections();
+      });
+    }
+  }
+
+  // =====================================================================
+  // 2g3. T5：推理档位识别（AC4.1 第 1 级 / AC4.2 第 2 级 / 三级漏斗）
+  // =====================================================================
+  {
+    const {
+      normalizeModelId, familyEfforts, effortsFromModelMeta, effortsFromOllamaShow,
+      readCodexModelEfforts, resolveEfforts, AiOrganizer,
+    } = require(path.join(ROOT, 'src/main/ai-organizer'));
+
+    await t('2g3 归一化', 'normalizeModelId：剥离 provider/ 前缀、:tag、-202x-xx-xx 日期后缀并小写', () => {
+      const cases = [
+        ['openai/gpt-5.2-pro', 'gpt-5.2-pro'],
+        ['openrouter/anthropic/claude-opus-4-7', 'claude-opus-4-7'],
+        ['gpt-5.2:beta', 'gpt-5.2'],
+        ['qwen3:8b', 'qwen3'],
+        ['gpt-5.2-2025-08-07', 'gpt-5.2'],
+        ['openai/gpt-5.2-pro:beta-2025-08-07', 'gpt-5.2-pro'],
+        ['  GPT-5.2  ', 'gpt-5.2'],
+        ['gpt-5.2-2025-08-07-preview', 'gpt-5.2-2025-08-07-preview'],
+        ['', ''],
+        ['   ', ''],
+        [null, ''],
+        [undefined, ''],
+      ];
+      for (const [input, expected] of cases) assert.equal(normalizeModelId(input), expected, String(input));
+    });
+
+    await t('2g3 家族', 'familyEfforts：AC4.2 每条规则至少一个用例，具体变体优先于主家族', () => {
+      const cases = [
+        // 显式无档位
+        ['gpt-4o', []], ['gpt-4o-mini', []], ['o1-mini', []], ['o1-preview', []],
+        ['gpt-5-chat-latest', []], ['deepseek-chat', []], ['deepseek-reasoner', []],
+        // pro / codex-max 等具体变体
+        ['gpt-5.2-pro', ['medium', 'high', 'xhigh']], ['gpt-5.4-pro', ['medium', 'high', 'xhigh']],
+        ['gpt-5-pro', ['high']], ['o1-pro', ['high']], ['o3-pro', ['high']],
+        ['gpt-5.1-codex-max', ['low', 'medium', 'high', 'xhigh']],
+        // GPT-5.x 主家族
+        ['gpt-5.2', ['none', 'low', 'medium', 'high', 'xhigh']],
+        ['gpt-5.3', ['none', 'low', 'medium', 'high', 'xhigh']],
+        ['gpt-5.4', ['none', 'low', 'medium', 'high', 'xhigh']],
+        ['gpt-5.2-codex', ['none', 'low', 'medium', 'high', 'xhigh']],
+        ['gpt-5.1', ['none', 'low', 'medium', 'high']],
+        ['gpt-5', ['minimal', 'low', 'medium', 'high']],
+        ['gpt-6', ['low', 'medium', 'high', 'xhigh', 'max']],
+        // o 系列
+        ['o1', ['low', 'medium', 'high']], ['o3', ['low', 'medium', 'high']], ['o4-mini', ['low', 'medium', 'high']],
+        // Gemini
+        ['gemini-2.5-flash', ['none', 'low', 'medium', 'high']],
+        ['gemini-2.5-pro', ['low', 'medium', 'high']],
+        ['gemini-3-flash-preview', ['minimal', 'low', 'medium', 'high']],
+        ['gemini-3-pro-preview', ['low', 'medium', 'high']],
+        ['gemini-4-pro', ['low', 'medium', 'high']],
+        // Claude
+        ['claude-opus-4-7', ['low', 'medium', 'high', 'xhigh', 'max']],
+        ['claude-opus-4-6', ['low', 'medium', 'high', 'max']],
+        ['claude-sonnet-4-6', ['low', 'medium', 'high']],
+        ['claude-sonnet-4-5-20250929', ['low', 'medium', 'high']],
+        ['claude-3-7-sonnet-20250219', ['low', 'medium', 'high']],
+        // 其它家族
+        ['grok-3-mini', ['low', 'high']],
+        ['deepseek-v4', ['none', 'low', 'medium', 'high', 'max']],
+        ['deepseek-flash', ['none', 'low', 'medium', 'high', 'max']],
+        ['qwen3:8b', ['none', 'low', 'medium', 'high']],
+        ['qwq-32b', ['none', 'low', 'medium', 'high']],
+        ['glm-4.5', ['none', 'low', 'medium', 'high']],
+        ['glm-z1', ['none', 'low', 'medium', 'high']],
+        // 未命中
+        ['llama-3.3-70b', null], ['mystery-model', null], ['', null], [null, null],
+      ];
+      for (const [input, expected] of cases) {
+        assert.deepEqual(familyEfforts(input), expected, String(input));
+      }
+      // 返回值是副本，外部修改不污染规则库
+      const copy = familyEfforts('gpt-5.2');
+      copy.push('ultra');
+      assert.deepEqual(familyEfforts('gpt-5.2'), ['none', 'low', 'medium', 'high', 'xhigh']);
+    });
+
+    await t('2g3 元数据', 'effortsFromModelMeta：OpenRouter / Codex 字符串与对象混合 / thinking.levels / mandatory 剔除 none', () => {
+      assert.deepEqual(
+        effortsFromModelMeta({ reasoning: { supported_efforts: ['low', 'medium', 'high'] } }),
+        ['low', 'medium', 'high'],
+      );
+      assert.deepEqual(
+        effortsFromModelMeta({ reasoning: { supported_efforts: ['none', 'low', 'high'], mandatory: true } }),
+        ['low', 'high'],
+        'mandatory 时剔除 none',
+      );
+      assert.deepEqual(
+        effortsFromModelMeta({ reasoning: { supported_efforts: ['none', 'low'], mandatory: false } }),
+        ['none', 'low'],
+        '非 mandatory 保留 none',
+      );
+      assert.deepEqual(
+        effortsFromModelMeta({ reasoning: { supported_efforts: ['none'], mandatory: true } }),
+        [],
+        '只剩 none 被剔除后是显式空档位，不是未知',
+      );
+      assert.deepEqual(
+        effortsFromModelMeta({ supported_reasoning_levels: ['low', 'high'] }),
+        ['low', 'high'],
+      );
+      assert.deepEqual(
+        effortsFromModelMeta({ supported_reasoning_levels: [{ effort: 'low' }, { level: 'high' }, 'medium'] }),
+        ['low', 'high', 'medium'],
+        '字符串与 { effort | level } 对象混合',
+      );
+      assert.deepEqual(
+        effortsFromModelMeta({ supported_reasoning_efforts: [{ effort: 'high' }, 'xhigh'] }),
+        ['high', 'xhigh'],
+      );
+      assert.deepEqual(
+        effortsFromModelMeta({ thinking: { levels: ['low', 'medium'] } }),
+        ['low', 'medium'],
+      );
+      assert.deepEqual(
+        effortsFromModelMeta({ metadata: { supported_reasoning_levels: ['minimal', 'low'] } }),
+        ['minimal', 'low'],
+        '兼容 metadata 包装',
+      );
+      assert.deepEqual(effortsFromModelMeta({ reasoning: { supported_efforts: ['low', 'LOW', 'low'] } }), ['low'], '去重');
+      assert.deepEqual(effortsFromModelMeta({ reasoning: { supported_efforts: [] } }), [], '字段存在即权威');
+      assert.equal(effortsFromModelMeta({ reasoning: {} }), null);
+      assert.equal(effortsFromModelMeta({}), null);
+      assert.equal(effortsFromModelMeta(null), null);
+      assert.equal(effortsFromModelMeta('gpt-5.2'), null);
+    });
+
+    await t('2g3 Ollama', 'effortsFromOllamaShow：thinking.values 字符串直取，布尔数组映射 none/high', () => {
+      assert.deepEqual(effortsFromOllamaShow({ thinking: { values: ['low', 'medium', 'high'] } }), ['low', 'medium', 'high']);
+      assert.deepEqual(effortsFromOllamaShow({ thinking: { values: [false, true] } }), ['none', 'high']);
+      assert.deepEqual(effortsFromOllamaShow({ thinking: { values: [true] } }), ['high']);
+      assert.deepEqual(effortsFromOllamaShow({ thinking: { values: [] } }), []);
+      assert.equal(effortsFromOllamaShow({ thinking: {} }), null);
+      assert.equal(effortsFromOllamaShow({}), null);
+      assert.equal(effortsFromOllamaShow(null), null);
+    });
+
+    await t('2g3 Codex 缓存', 'readCodexModelEfforts：经 sourceRoots().codex 只读解析 models_cache.json，缺文件/未命中返回 null', () => {
+      const codexRoot = sourceRoots().codex;
+      assert.equal(codexRoot, process.env.MEM0_CODEX_ROOT, '必须经 paths.sourceRoots() 保持测试隔离');
+      const file = path.join(codexRoot, 'models_cache.json');
+      fs.mkdirSync(codexRoot, { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({
+        models: [
+          { slug: 'gpt-5.2-codex', supported_reasoning_levels: ['low', 'medium', 'high', 'xhigh'] },
+          { slug: 'gpt-5.1-codex-max-2025-09-15', supported_reasoning_levels: [{ effort: 'low' }, { level: 'high' }] },
+          { slug: 'gpt-4o', supported_reasoning_levels: [] },
+        ],
+      }));
+      assert.deepEqual(readCodexModelEfforts('openai/gpt-5.2-codex:latest'), ['low', 'medium', 'high', 'xhigh']);
+      assert.deepEqual(readCodexModelEfforts('gpt-5.1-codex-max'), ['low', 'high'], '缓存条目同样做前缀/日期剥离');
+      assert.deepEqual(readCodexModelEfforts('gpt-4o'), [], '缓存里的空数组是显式无档位');
+      assert.equal(readCodexModelEfforts('gpt-5.2-pro'), null, '缓存未命中');
+      assert.equal(readCodexModelEfforts(''), null);
+      // 对象映射结构（以模型 ID 为键）同样支持
+      fs.writeFileSync(file, JSON.stringify({ models: { 'gpt-5.3-codex': { supported_reasoning_levels: ['low', 'high'] } } }));
+      assert.deepEqual(readCodexModelEfforts('gpt-5.3-codex'), ['low', 'high']);
+      // 文件损坏 / 缺失都不得抛错
+      fs.writeFileSync(file, '{ not json');
+      assert.equal(readCodexModelEfforts('gpt-5.2-codex'), null);
+      fs.rmSync(file);
+      assert.equal(readCodexModelEfforts('gpt-5.2-codex'), null);
+      // 禁止硬编码 os.homedir()：只允许走 paths.sourceRoots()
+      const src = fs.readFileSync(path.join(ROOT, 'src/main/ai-organizer.js'), 'utf8');
+      assert.ok(!src.includes('homedir'), 'ai-organizer.js 不得使用 os.homedir()');
+      assert.match(src, /sourceRoots\(\)/, 'ai-organizer.js 应经 paths.sourceRoots() 读取 Codex 缓存');
+    });
+
+    await t('2g3 漏斗', 'resolveEfforts：第 1 级元数据 / Ollama / Codex 优先，否则第 2 级家族，未命中 null', () => {
+      assert.deepEqual(resolveEfforts({ modelId: 'gpt-4o', item: { reasoning: { supported_efforts: ['high'] } } }), ['high'], '元数据优先');
+      assert.deepEqual(resolveEfforts({ modelId: 'qwen3:8b', ollamaEfforts: [false, true] }), ['none', 'high'], 'Ollama 优先于家族');
+      assert.deepEqual(resolveEfforts({ modelId: 'gpt-5.2-codex', codexEfforts: ['minimal'] }), ['minimal'], 'Codex 缓存优先于家族');
+      assert.deepEqual(resolveEfforts({ modelId: 'gpt-5.2', item: { supported_reasoning_levels: [] } }), [], '显式空档位不被家族覆盖');
+      assert.deepEqual(resolveEfforts({ modelId: 'gpt-5.2-pro' }), ['medium', 'high', 'xhigh'], '落到家族规则');
+      assert.deepEqual(resolveEfforts({ modelId: 'gpt-4o' }), [], '显式无档位');
+      assert.equal(resolveEfforts({ modelId: 'mystery-model' }), null, '未知返回 null');
+      assert.equal(resolveEfforts({}), null);
+      assert.deepEqual(resolveEfforts({ modelId: 'gpt-5.2', ollamaEfforts: [] }), [], '空数组是显式无档位，不再下钻');
+      assert.deepEqual(resolveEfforts('gpt-5.2-pro'), ['medium', 'high', 'xhigh'], '兼容位置参数调用');
+      assert.deepEqual(resolveEfforts('gpt-4o', null, ['high']), ['high'], '位置参数：Ollama 结果优先');
+    });
+
+    // -------- 假 fetch：记录调用并按路由返回 JSON --------
+    const makeFetch = (routes) => {
+      const calls = [];
+      const fn = async (url, opts = {}) => {
+        const method = opts.method || 'GET';
+        const call = {
+          url: String(url),
+          method,
+          headers: opts.headers || {},
+          body: opts.body ? JSON.parse(opts.body) : null,
+        };
+        calls.push(call);
+        const route = routes.find(([m, re]) => m === method && re.test(String(url)));
+        if (!route) return { ok: false, status: 404, json: async () => ({ error: 'not found' }) };
+        const out = typeof route[2] === 'function' ? route[2](call) : route[2];
+        const status = out && out.status ? out.status : 200;
+        const body = out && Object.prototype.hasOwnProperty.call(out, 'body') ? out.body : out;
+        return { ok: status < 400, status, json: async () => body };
+      };
+      fn.calls = calls;
+      return fn;
+    };
+
+    await t('2g3 接入', 'fetchAiModels：每个模型带 efforts（元数据 > 家族），非回环地址不探测 /api/show', async () => {
+      const store = freshStore();
+      const fetchImpl = makeFetch([['GET', /\/models$/, {
+        object: 'list',
+        data: [
+          { id: 'anthropic/claude-opus-4-7:beta', reasoning: { supported_efforts: ['none', 'low', 'high'], mandatory: true } },
+          { id: 'gpt-5.2-codex', supported_reasoning_levels: [{ effort: 'low' }, 'high'] },
+          { id: 'deepseek-chat' },
+          { id: 'mystery-model' },
+          'gpt-6',
+        ],
+      }]]);
+      const org = new AiOrganizer({ store, fetchImpl });
+      const before = org.getPublicState();
+      const r = await org.fetchAiModels({ provider: 'openai', baseUrl: 'https://api.example.com/v1', apiKey: 'key-T5-1234567890' });
+      assert.equal(r.ok, true);
+      const byId = new Map(r.models.map((m) => [m.id, m]));
+      assert.deepEqual(byId.get('anthropic/claude-opus-4-7:beta').efforts, ['low', 'high'], 'mandatory 剔除 none');
+      assert.deepEqual(byId.get('gpt-5.2-codex').efforts, ['low', 'high'], 'Codex 字符串与对象混合');
+      assert.deepEqual(byId.get('deepseek-chat').efforts, [], '家族显式无档位');
+      assert.equal(byId.get('mystery-model').efforts, null, '未知模型 efforts 为 null');
+      assert.deepEqual(byId.get('gpt-6').efforts, ['low', 'medium', 'high', 'xhigh', 'max'], '纯字符串模型项也走家族规则');
+      assert.equal(fetchImpl.calls.length, 1, '非回环地址绝不探测 /api/show');
+      assert.equal(fetchImpl.calls[0].url, 'https://api.example.com/v1/models');
+      assert.deepEqual(org.getPublicState(), before, '只读调用不得改动配置');
+      store.close();
+    });
+
+    await t('2g3 接入', 'fetchAiModels：回环地址逐模型 POST /api/show，thinking.values 优先于家族规则，失败静默降级', async () => {
+      const store = freshStore();
+      const fetchImpl = makeFetch([
+        ['GET', /\/models$/, { data: [{ id: 'qwen3:8b' }, { id: 'llama3.2:latest' }, { id: 'broken:1b' }] }],
+        ['POST', /\/api\/show$/, (call) => {
+          if (call.body.model === 'qwen3:8b') return { thinking: { values: [false, true] } };
+          if (call.body.model === 'llama3.2:latest') return { thinking: { values: ['low', 'medium', 'high'] } };
+          return { status: 500, body: { error: 'boom' } };
+        }],
+      ]);
+      const org = new AiOrganizer({ store, fetchImpl });
+      const r = await org.fetchAiModels({ provider: 'openai', baseUrl: 'http://127.0.0.1:11434/v1' });
+      assert.equal(r.ok, true);
+      const byId = new Map(r.models.map((m) => [m.id, m]));
+      assert.deepEqual(byId.get('qwen3:8b').efforts, ['none', 'high'], 'Ollama 原生布尔档位优先于家族规则');
+      assert.deepEqual(byId.get('llama3.2:latest').efforts, ['low', 'medium', 'high']);
+      assert.equal(byId.get('broken:1b').efforts, null, '/api/show 500 时静默降级到家族（未命中 null）');
+      const shows = fetchImpl.calls.filter((c) => c.method === 'POST');
+      assert.equal(shows.length, 3, '每个模型一次 /api/show');
+      for (const call of shows) {
+        assert.equal(call.url, 'http://127.0.0.1:11434/api/show');
+        assert.equal(call.headers.Authorization, undefined, 'Ollama 探针不带 Key');
+      }
+      assert.deepEqual(shows.map((c) => c.body), [{ model: 'qwen3:8b' }, { model: 'llama3.2:latest' }, { model: 'broken:1b' }]);
+      store.close();
+    });
+
+    await t('2g3 接入', 'fetchAiModels：正文读取永不结束时按超时返回 error，不无限挂起（AC5.4 全周期超时）', async () => {
+      const store = freshStore();
+      const hung = () => new Promise(() => {});
+      // fetch 立刻返回 200，但正文 json()/text() 永不 resolve：超时必须覆盖到正文读完
+      const fetchImpl = async () => ({ ok: true, status: 200, json: hung, text: hung });
+      const org = new AiOrganizer({ store, fetchImpl });
+      const started = Date.now();
+      const r = await org.fetchAiModels({ provider: 'openai', baseUrl: 'https://api.example.com/v1', apiKey: 'key-T8-1234567890' }, { timeoutMs: 80 });
+      const elapsed = Date.now() - started;
+      assert.equal(r.ok, false, '正文读不完必须判失败');
+      assert.deepEqual(r.models, []);
+      assert.match(r.error, /超时/, r.error);
+      assert.ok(elapsed < 2000, `应在注入的 80ms 超时附近返回，实际 ${elapsed}ms`);
+      assert.deepEqual(org.getPublicState(), new AiOrganizer({ store }).getPublicState(), '超时也不得改动配置');
+
+      // 同一超时同样包住 /api/show 的正文读取：回环地址下探测挂起必须收敛（降级到家族规则）
+      const orgLoop = new AiOrganizer({
+        store,
+        fetchImpl: async (url) => (String(url).endsWith('/models')
+          ? { ok: true, status: 200, json: async () => ({ data: [{ id: 'mystery-model' }] }) }
+          : { ok: true, status: 200, json: hung, text: hung }),
+      });
+      const loopStart = Date.now();
+      const rl = await orgLoop.fetchAiModels({ provider: 'openai', baseUrl: 'http://127.0.0.1:11434/v1' }, { timeoutMs: 80 });
+      assert.equal(rl.ok, true, '单模型档位探测挂起不得拖垮整份模型列表');
+      assert.equal(rl.models[0].id, 'mystery-model');
+      assert.equal(rl.models[0].efforts, null, '探测超时静默降级，未知模型保持 null');
+      assert.ok(Date.now() - loopStart < 2000, '每个模型的 /api/show 都必须被超时包住');
+      store.close();
+    });
+
+    await t('2g3 单模型', 'resolveModelEfforts：只读按单个模型解析，空模型名报错，不调用 saveConfig', async () => {
+      const store = freshStore();
+      const fetchImpl = makeFetch([
+        ['POST', /\/api\/show$/, { thinking: { values: ['low', 'medium', 'high'] } }],
+      ]);
+      const org = new AiOrganizer({ store, fetchImpl });
+      org.saveConfig({ provider: 'openai', baseUrl: 'https://api.example.com/v1', model: 'gpt-4o', apiKey: 'key-T5-1234567890' });
+      const before = org.getPublicState();
+
+      const remote = await org.resolveModelEfforts({ provider: 'openai', baseUrl: 'https://api.example.com/v1' }, 'gpt-5.2-pro');
+      assert.equal(remote.ok, true);
+      assert.equal(remote.modelId, 'gpt-5.2-pro');
+      assert.deepEqual(remote.efforts, ['medium', 'high', 'xhigh']);
+      assert.equal(remote.error, '');
+
+      const meta = await org.resolveModelEfforts(
+        { provider: 'openai', baseUrl: 'https://api.example.com/v1', item: { reasoning: { supported_efforts: ['minimal'] } } },
+        'gpt-5.2',
+      );
+      assert.deepEqual(meta.efforts, ['minimal'], '草稿 item 元数据优先');
+
+      const local = await org.resolveModelEfforts({ provider: 'ollama', baseUrl: 'http://127.0.0.1:11434/v1' }, 'llama3.2:latest');
+      assert.deepEqual(local.efforts, ['low', 'medium', 'high'], 'ollama 预设走 /api/show');
+      assert.equal(fetchImpl.calls.filter((c) => c.method === 'POST').length, 1);
+
+      const bad = await org.resolveModelEfforts({}, '   ');
+      assert.equal(bad.ok, false);
+      assert.equal(bad.efforts, null);
+      assert.equal(bad.error, '模型名称无效');
+
+      const unknown = await org.resolveModelEfforts({ provider: 'openai', baseUrl: 'https://api.example.com/v1' }, 'mystery-model');
+      assert.equal(unknown.ok, true);
+      assert.equal(unknown.efforts, null, '未知返回 null 而非 []');
+      assert.deepEqual(org.getPublicState(), before, '只读调用不得改动配置 / 密钥');
+      store.close();
+    });
+  }
+
+  // =====================================================================
+  // 2g4. T6：推理档位开放字符串存储与界面接线（AC4.3）
+  // =====================================================================
+  {
+    const { AiOrganizer, normalizeReasoningEffort, AI_CONFIG_KV } = require(path.join(ROOT, 'src/main/ai-organizer'));
+
+    await t('2g4 档位存储', 'reasoningEffort 默认空串；空串 / none / 自定义原样保存并可跨实例恢复', () => {
+      const store = freshStore();
+      const org = new AiOrganizer({ store });
+      assert.equal(org.getPublicState().reasoningEffort, '');
+      assert.equal(normalizeReasoningEffort(undefined), '');
+      assert.equal(normalizeReasoningEffort(null), '');
+      assert.equal(normalizeReasoningEffort(123), '');
+      assert.equal(normalizeReasoningEffort({}), '');
+      assert.equal(normalizeReasoningEffort('none'), 'none');
+      assert.equal(normalizeReasoningEffort(' Ultra-Custom '), ' Ultra-Custom ', '开放字符串不做白名单裁剪');
+
+      assert.equal(org.saveConfig({ reasoningEffort: 'none' }).reasoningEffort, 'none');
+      assert.equal(org.getPublicState().reasoningEffort, 'none', '显式 none 必须保留');
+      assert.equal(org.saveConfig({ reasoningEffort: 'Ultra-Custom' }).reasoningEffort, 'Ultra-Custom', '任意字符串原样保存');
+      assert.equal(new AiOrganizer({ store }).getPublicState().reasoningEffort, 'Ultra-Custom', '落盘并跨实例恢复');
+
+      org.saveConfig({ reasoningEffort: '' });
+      assert.equal(org.getPublicState().reasoningEffort, '', '空串 = 默认不传参数');
+      assert.notEqual(org.getPublicState().reasoningEffort, 'none', '空串与 none 严格区分');
+      assert.equal(new AiOrganizer({ store }).getPublicState().reasoningEffort, '', '空串同样落盘');
+      assert.equal(org.saveConfig({ reasoningEffort: null }).reasoningEffort, '', '非字符串归空串');
+
+      // 旧配置没有该字段时安全降级为空串
+      store.setKv(AI_CONFIG_KV, JSON.stringify({
+        enabled: false, provider: 'deepseek', baseUrl: 'https://api.deepseek.com/v1',
+        model: 'deepseek-chat', apiMode: 'chat_completions',
+      }));
+      assert.equal(new AiOrganizer({ store }).getPublicState().reasoningEffort, '');
+      store.close();
+    });
+
+    await t('2g4 档位界面', 'EMPTY_AI_STATE / 保存 payload / LRU 50 / 记忆键 / 折叠与提示文案静态接线齐全', () => {
+      const indexSrc = fs.readFileSync(path.join(ROOT, 'src/main/index.js'), 'utf8');
+      const empty = /const EMPTY_AI_STATE = \{([\s\S]*?)\n\};/.exec(indexSrc);
+      assert.ok(empty, 'index.js 应有 EMPTY_AI_STATE');
+      assert.match(empty[1], /reasoningEffort:\s*''/);
+
+      const memSrc = fs.readFileSync(path.join(ROOT, 'src/renderer/memory.js'), 'utf8');
+      assert.match(memSrc, /reasoningEffort:\s*String\(aiDraft\.reasoningEffort \|\| ''\)/, '保存 payload 必须带 reasoningEffort');
+      assert.match(memSrc, /AI_EFFORT_MEMORY_LIMIT\s*=\s*50/, 'LRU 上限 50 条');
+      assert.ok(memSrc.includes('}::${aiOrigin(baseUrl)}::${String(model'), '记忆键为 provider::origin::model');
+      assert.match(memSrc, /AI_HIGH_EFFORTS\s*=\s*\[[^\]]*'high'[^\]]*'xhigh'[^\]]*'max'[^\]]*'ultra'/, '高消耗档位提示集合');
+      assert.ok(memSrc.includes('默认（不指定）'), '无档位模型折叠行文案');
+      assert.ok(memSrc.includes('自定义档位'), '折叠行自定义入口');
+      assert.ok(memSrc.includes('后台耗时与 Token 消耗更多'), '高消耗档位淡提示');
+      assert.ok(memSrc.includes('resolveAiModelEfforts'), '切模型走只读档位解析');
+      assert.ok(!memSrc.includes('insertAdjacentHTML'), '严格 CSP：禁止 insertAdjacentHTML');
+      assert.doesNotMatch(memSrc.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, ''), /\.style\./, '严格 CSP：禁止内联样式赋值');
+    });
+  }
+
+  // =====================================================================
   // 2h. I2 AI 自动整理：双水位线 / 空闲防抖 / 写入红线 / 粘贴拆卡（SPEC 3.5-3.6）
   // =====================================================================
   {
@@ -3136,10 +3842,13 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       store.close();
     });
 
-    await t('2h 围栏', 'parseOrganizerJson 兼容 ```json 围栏与前后说明文字，非法文本返回 null', () => {
-      assert.deepEqual(parseOrganizerJson('```json\n{"a":1}\n```'), { a: 1 });
-      assert.deepEqual(parseOrganizerJson('说明\n```JSON\n[1,2]\n```\n结尾'), [1, 2]);
-      assert.deepEqual(parseOrganizerJson('前言 {"a":2} 后记'), { a: 2 });
+    await t('2h 围栏', 'parseOrganizerJson 只在开头剥 think 块（整串围栏仍兼容），不再从正文中间截 JSON', () => {
+      // AC5.5：extractJsonCandidate 仅锚定字符串开头剥离 think / thought 块
+      assert.deepEqual(parseOrganizerJson('```json\n{"a":1}\n```'), { a: 1 }, '整串围栏仍可解析');
+      assert.deepEqual(parseOrganizerJson('<think>思考 {"x":1}</think>\n{"a":2}'), { a: 2 }, '开头 think 块被剥离');
+      assert.deepEqual(parseOrganizerJson('<thought>a</thought><think>b</think>{"a":3}'), { a: 3 }, '连续多个思考块');
+      assert.equal(parseOrganizerJson('说明\n```JSON\n[1,2]\n```\n结尾'), null, '围栏必须首尾锚定，不再中间搜');
+      assert.equal(parseOrganizerJson('前言 {"a":2} 后记'), null, '禁止从正文中间截取 JSON');
       assert.equal(parseOrganizerJson('这不是 JSON'), null);
       assert.equal(parseOrganizerJson(''), null);
     });
@@ -3522,6 +4231,375 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
     await new Promise((resolve) => {
       mockServer.close(resolve);
       if (typeof mockServer.closeAllConnections === 'function') mockServer.closeAllConnections();
+    });
+  }
+
+  // =====================================================================
+  // 2j. T7：双协议请求构造 / 全周期超时 / 双模 SSE（AC5）
+  // =====================================================================
+  {
+    const {
+      AiOrganizer, DEFAULT_TIMEOUT_MS, REASONING_TIMEOUT_MS,
+    } = require(path.join(ROOT, 'src/main/ai-organizer'));
+
+    const makeOrg = (store, fetchImpl, opts = {}) => {
+      const org = new AiOrganizer({ store, fetchImpl, ...opts });
+      org.saveConfig({
+        enabled: true,
+        provider: 'openai',
+        baseUrl: 'https://api.example.com/v1',
+        model: 'mock-model',
+        apiKey: 'key-T7-1234567890',
+        apiMode: 'chat_completions',
+        reasoningEffort: '',
+      });
+      return org;
+    };
+    const jsonRes = (data, status = 200) => ({
+      ok: status < 400,
+      status,
+      headers: { 'content-type': 'application/json' },
+      text: async () => JSON.stringify(data),
+    });
+    const sseRes = (text, contentType = 'text/event-stream') => ({
+      ok: true,
+      status: 200,
+      headers: { 'content-type': contentType },
+      text: async () => text,
+    });
+
+    await t('2j 请求体', 'chat_completions：messages + 顶层 reasoning_effort；默认不发 max_tokens / temperature / top_p', async () => {
+      const store = freshStore();
+      const calls = [];
+      const org = makeOrg(store, async (url, init) => {
+        calls.push({ url, headers: init.headers, body: JSON.parse(init.body) });
+        return jsonRes({ choices: [{ message: { role: 'assistant', content: 'OK' } }] });
+      });
+
+      assert.equal(await org.callChat([{ role: 'system', content: 'S' }, { role: 'user', content: 'U' }]), 'OK');
+      assert.equal(calls[0].url, 'https://api.example.com/v1/chat/completions');
+      assert.equal(calls[0].headers.Authorization, 'Bearer key-T7-1234567890');
+      assert.deepEqual(calls[0].body, {
+        model: 'mock-model',
+        messages: [{ role: 'system', content: 'S' }, { role: 'user', content: 'U' }],
+      }, '默认请求体只有 model + messages');
+      for (const key of ['max_tokens', 'max_output_tokens', 'temperature', 'top_p', 'reasoning_effort', 'store']) {
+        assert.equal(key in calls[0].body, false, `默认绝不发 ${key}`);
+      }
+
+      org.saveConfig({ reasoningEffort: 'high' });
+      await org.callChat([{ role: 'user', content: 'U' }]);
+      assert.deepEqual(calls[1].body, {
+        model: 'mock-model',
+        messages: [{ role: 'user', content: 'U' }],
+        reasoning_effort: 'high',
+      }, 'reasoningEffort 非空时仅传顶层 reasoning_effort');
+
+      await org.callChat([{ role: 'user', content: 'U' }], { maxTokens: 64 });
+      assert.equal(calls[2].body.max_tokens, 64, '仅显式 maxTokens 才发送');
+      assert.equal('max_output_tokens' in calls[2].body, false);
+      store.close();
+    });
+
+    await t('2j 请求体', 'responses：system/developer → instructions，其余 → input，store:false，reasoning.effort', async () => {
+      const store = freshStore();
+      const calls = [];
+      const org = makeOrg(store, async (url, init) => {
+        calls.push({ url, body: JSON.parse(init.body) });
+        return jsonRes({ output_text: 'OK' });
+      });
+      org.saveConfig({ apiMode: 'responses', reasoningEffort: 'xhigh' });
+      assert.equal(await org.callChat([
+        { role: 'system', content: '系统提示' },
+        { role: 'developer', content: '开发提示' },
+        { role: 'user', content: '问题' },
+        { role: 'assistant', content: '回答' },
+      ]), 'OK');
+      assert.equal(calls[0].url, 'https://api.example.com/v1/responses');
+      assert.deepEqual(calls[0].body, {
+        model: 'mock-model',
+        input: [
+          { role: 'user', content: [{ type: 'input_text', text: '问题' }] },
+          { role: 'assistant', content: [{ type: 'output_text', text: '回答' }] },
+        ],
+        store: false,
+        instructions: '系统提示\n\n开发提示',
+        reasoning: { effort: 'xhigh' },
+      });
+      for (const key of ['max_tokens', 'max_output_tokens', 'temperature', 'top_p', 'messages', 'reasoning_effort']) {
+        assert.equal(key in calls[0].body, false, `responses 默认绝不发 ${key}`);
+      }
+
+      org.saveConfig({ reasoningEffort: '' });
+      await org.callChat([{ role: 'user', content: '只一个问题' }]);
+      assert.deepEqual(calls[1].body, {
+        model: 'mock-model',
+        input: [{ role: 'user', content: [{ type: 'input_text', text: '只一个问题' }] }],
+        store: false,
+      }, '空档位不传 reasoning、无 system 时无 instructions');
+      store.close();
+    });
+
+    await t('2j 快照', 'callChat 入口浅拷贝配置：请求飞行期间 saveConfig 不改变本次请求', async () => {
+      const store = freshStore();
+      const calls = [];
+      let org = null;
+      org = makeOrg(store, async (url, init) => {
+        calls.push({ url, body: JSON.parse(init.body) });
+        org.saveConfig({ model: 'changed-model', baseUrl: 'https://other.example.com/v1', apiMode: 'responses' });
+        return jsonRes({ choices: [{ message: { content: 'OK' } }] });
+      });
+      assert.equal(await org.callChat([{ role: 'user', content: 'ping' }]), 'OK');
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].url, 'https://api.example.com/v1/chat/completions', 'URL 用入口快照');
+      assert.equal(calls[0].body.model, 'mock-model', 'model 用入口快照');
+      assert.equal('messages' in calls[0].body, true, '协议用入口快照');
+      assert.equal(org.getPublicState().model, 'changed-model', '飞行期间的配置修改照常生效');
+      store.close();
+    });
+
+    await t('2j 超时', '推理 / responses 默认超时 90 秒，普通模式仍 30 秒', () => {
+      assert.equal(REASONING_TIMEOUT_MS, 90_000);
+      assert.equal(DEFAULT_TIMEOUT_MS, 30_000);
+    });
+
+    await t('2j 超时', '半开 SSE 流超时：callChat 拒绝、organizeConversation 复位 organizing', async () => {
+      const store = freshStore();
+      const base = 1_700_000_900_000;
+      const conv = store.upsertConversation({
+        source: 'claude-code',
+        externalId: 't7-half-open',
+        ingestMethod: 'local',
+        createdAt: base - 1000,
+        updatedAt: base,
+        messages: [{ role: 'user', content: '问' }, { role: 'assistant', content: '答' }],
+      });
+      let aborted = false;
+      const org = new AiOrganizer({
+        store,
+        idleMs: 100,
+        checkIntervalMs: 10,
+        timeoutMs: 60,
+        // text() 永不 resolve，模拟半开流：正文读取也必须被超时包住
+        fetchImpl: (url, init) => {
+          init.signal.addEventListener('abort', () => { aborted = true; });
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: { 'content-type': 'text/event-stream' },
+            text: () => new Promise(() => {}),
+          });
+        },
+      });
+      org.saveConfig({
+        enabled: true, provider: 'openai', baseUrl: 'https://api.example.com/v1',
+        model: 'mock-model', apiKey: 'key-T7-1234567890',
+      });
+      const started = Date.now();
+      const r = await org.organizeConversation(conv.id);
+      const elapsed = Date.now() - started;
+      assert.equal(r, null, '超时不得写库');
+      assert.equal(org.organizing, false, '超时后 organizing 必须复位');
+      assert.equal(org.getPublicState().organizing, false);
+      assert.match(org._lastError, /超时/);
+      assert.ok(elapsed < 2000, `应在注入的 60ms 超时附近失败，实际 ${elapsed}ms`);
+      assert.equal(aborted, true, '超时必须 abort 底层请求');
+      store.close();
+    });
+
+    await t('2j 400 重试', 'responses 400：要求 stream:true / 拒绝 store 各重试一次；无关 400 不重试', async () => {
+      const store = freshStore();
+
+      const streamCalls = [];
+      const streamOrg = makeOrg(store, async (url, init) => {
+        const body = JSON.parse(init.body);
+        streamCalls.push(body);
+        if (streamCalls.length === 1) {
+          return {
+            ok: false,
+            status: 400,
+            headers: { 'content-type': 'application/json' },
+            text: async () => JSON.stringify({ error: { message: 'This endpoint requires stream: true' } }),
+          };
+        }
+        return jsonRes({ output_text: '重试成功' });
+      });
+      streamOrg.saveConfig({ apiMode: 'responses' });
+      assert.equal(await streamOrg.callChat([{ role: 'user', content: 'U' }]), '重试成功');
+      assert.equal(streamCalls.length, 2, '只重试一次');
+      assert.equal('stream' in streamCalls[0], false);
+      assert.equal(streamCalls[1].stream, true, '400 要求流式时补 stream:true');
+      assert.equal(streamCalls[1].store, false, '仅补 stream，不误删 store');
+      assert.deepEqual(streamCalls[1].input, streamCalls[0].input);
+
+      const storeCalls = [];
+      const storeOrg = makeOrg(store, async (url, init) => {
+        const body = JSON.parse(init.body);
+        storeCalls.push(body);
+        if (storeCalls.length === 1) {
+          return {
+            ok: false,
+            status: 400,
+            headers: { 'content-type': 'application/json' },
+            text: async () => JSON.stringify({ error: { message: 'Unknown parameter: store is not supported' } }),
+          };
+        }
+        return jsonRes({ output: [{ type: 'message', content: [{ type: 'output_text', text: '剥离成功' }] }] });
+      });
+      storeOrg.saveConfig({ apiMode: 'responses' });
+      assert.equal(await storeOrg.callChat([{ role: 'user', content: 'U' }]), '剥离成功');
+      assert.equal(storeCalls.length, 2);
+      assert.equal('store' in storeCalls[1], false, '400 拒绝 store 时剥离后重试');
+      assert.equal('stream' in storeCalls[1], false);
+
+      const plainCalls = [];
+      const plainOrg = makeOrg(store, async () => {
+        plainCalls.push(1);
+        return {
+          ok: false,
+          status: 400,
+          headers: { 'content-type': 'application/json' },
+          text: async () => JSON.stringify({ error: { message: 'invalid model' } }),
+        };
+      });
+      plainOrg.saveConfig({ apiMode: 'responses' });
+      await assert.rejects(() => plainOrg.callChat([{ role: 'user', content: 'U' }]), /HTTP 400.*invalid model/);
+      assert.equal(plainCalls.length, 1, '无关 400 不重试');
+      store.close();
+    });
+
+    await t('2j 无 res.text', '只有 json() 的 mock 替身仍可解析（typeof res.text 嗅探）', async () => {
+      const store = freshStore();
+      const org = makeOrg(store, async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          output_text: 'RESP 文本',
+          choices: [{ message: { role: 'assistant', content: 'CHAT 文本' } }],
+        }),
+      }));
+      assert.equal(await org.callChat([{ role: 'user', content: 'ping' }]), 'CHAT 文本', 'json 替身走 chat 解析');
+      org.saveConfig({ apiMode: 'responses' });
+      assert.equal(await org.callChat([{ role: 'user', content: 'ping' }]), 'RESP 文本', 'json 替身走 output_text 分支');
+      store.close();
+    });
+
+    await t('2j SSE', 'chat_completions SSE：delta 累加、[DONE]、keep-alive 与思考增量过滤', async () => {
+      const store = freshStore();
+      const sse = [
+        ': SSE-Keep-Alive',
+        'event: SSE-Keep-Alive',
+        'data: {}',
+        '',
+        'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+        '',
+        'data: {"choices":[{"delta":{"reasoning_content":"这段思考不应出现"}}]}',
+        '',
+        'data: {"choices":[{"delta":{"thinking":"这段也不应出现"}}]}',
+        '',
+        'data: {"choices":[{"delta":{"content":"你好"}}]}',
+        '',
+        'data: {"choices":[{"delta":{"content":"，世界"}}]}',
+        '',
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        '',
+        'data: [DONE]',
+        '',
+      ].join('\n');
+      const org = makeOrg(store, async () => sseRes(sse));
+      assert.equal(await org.callChat([{ role: 'user', content: 'U' }]), '你好，世界');
+
+      // 无 content-type，仅凭首非空行 data: 识别 SSE
+      const store2 = freshStore();
+      const bare = makeOrg(store2, async () => ({
+        ok: true,
+        status: 200,
+        text: async () => 'data: {"choices":[{"delta":{"content":"A"}}]}\n\ndata: [DONE]\n\n',
+      }));
+      assert.equal(await bare.callChat([{ role: 'user', content: 'U' }]), 'A');
+
+      // SSE 里的 error 对象必须抛出
+      const store3 = freshStore();
+      const errOrg = makeOrg(store3, async () => sseRes('data: {"error":{"message":"quota exceeded"}}\n\n'));
+      await assert.rejects(() => errOrg.callChat([{ role: 'user', content: 'U' }]), /quota exceeded/);
+      store.close();
+      store2.close();
+      store3.close();
+    });
+
+    await t('2j SSE', 'responses SSE：completed 全文优先、delta 累加不重复、思考增量过滤', async () => {
+      const store = freshStore();
+      const withCompleted = [
+        'event: response.created',
+        'data: {"type":"response.created","response":{"id":"r1"}}',
+        '',
+        'event: response.reasoning_summary_text.delta',
+        'data: {"type":"response.reasoning_summary_text.delta","delta":"思考片段"}',
+        '',
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"片段一"}',
+        '',
+        'data: {"type":"response.output_text.delta","delta":"片段二"}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"output_text":"完整全文"}}',
+        '',
+      ].join('\n');
+      const org = makeOrg(store, async () => sseRes(withCompleted));
+      org.saveConfig({ apiMode: 'responses' });
+      assert.equal(await org.callChat([{ role: 'user', content: 'U' }]), '完整全文', 'completed 全文优先，绝不与 delta 双倍拼接');
+
+      // 没有 completed 时累加 output_text.delta，忽略 reasoning 增量
+      const deltaOnly = [
+        'event: response.reasoning_text.delta',
+        'data: {"type":"response.reasoning_text.delta","delta":"思考"}',
+        '',
+        'data: {"type":"response.output_text.delta","delta":"甲"}',
+        '',
+        'data: {"type":"response.output_text.delta","delta":"乙"}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":""}]}]}}',
+        '',
+      ].join('\n');
+      const store2 = freshStore();
+      const org2 = makeOrg(store2, async () => sseRes(deltaOnly));
+      org2.saveConfig({ apiMode: 'responses' });
+      assert.equal(await org2.callChat([{ role: 'user', content: 'U' }]), '甲乙', 'completed 无全文时回退 delta 累加');
+
+      // completed 用 output 数组给全文
+      const outputArray = [
+        'data: {"type":"response.output_text.delta","delta":"不应出现"}',
+        '',
+        'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"数组全文"}]}]}}',
+        '',
+      ].join('\n');
+      const store3 = freshStore();
+      const org3 = makeOrg(store3, async () => sseRes(outputArray));
+      org3.saveConfig({ apiMode: 'responses' });
+      assert.equal(await org3.callChat([{ role: 'user', content: 'U' }]), '数组全文');
+      store.close();
+      store2.close();
+      store3.close();
+    });
+
+    await t('2j SSE', 'responses SSE / 顶层 JSON：response.failed、error 事件与 { error } 一律抛出', async () => {
+      const store = freshStore();
+      const failed = makeOrg(store, async () => sseRes(
+        'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"message":"upstream boom"}}}\n\n',
+      ));
+      failed.saveConfig({ apiMode: 'responses' });
+      await assert.rejects(() => failed.callChat([{ role: 'user', content: 'U' }]), /upstream boom/);
+
+      const errorEvent = makeOrg(store, async () => sseRes(
+        'event: error\ndata: {"type":"error","message":"bad request"}\n\n',
+      ));
+      errorEvent.saveConfig({ apiMode: 'responses' });
+      await assert.rejects(() => errorEvent.callChat([{ role: 'user', content: 'U' }]), /bad request/);
+
+      const jsonError = makeOrg(store, async () => jsonRes({ error: { message: 'invalid api key' } }));
+      await assert.rejects(() => jsonError.callChat([{ role: 'user', content: 'U' }]), /invalid api key/);
+      store.close();
     });
   }
 
@@ -4043,11 +5121,148 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       assert.equal(dm.relaunchOptions(undefined, '/opt/mem0/mem0', []), undefined);
       assert.equal(dm.relaunchOptions({ PORTABLE_EXECUTABLE_FILE: '' }, 'x', ['x']), undefined);
     });
+    await t('5.5 relaunch', '--hidden 重启剥离该参数；免安装 / AppImage 仍用外层可执行文件', () => {
+      assert.deepEqual(dm.relaunchOptions({}, 'C:\\Apps\\mem0.exe', ['C:\\Apps\\mem0.exe', '--hidden']),
+        { execPath: 'C:\\Apps\\mem0.exe', args: [] });
+      assert.deepEqual(dm.relaunchOptions({}, 'C:\\Apps\\mem0.exe', ['C:\\Apps\\mem0.exe', '--hidden', '--no-sandbox']),
+        { execPath: 'C:\\Apps\\mem0.exe', args: ['--no-sandbox'] });
+      assert.deepEqual(dm.relaunchOptions({ PORTABLE_EXECUTABLE_FILE: 'p.exe' }, 'C:\\Temp\\mem0.exe', ['C:\\Temp\\mem0.exe', '--hidden']),
+        { execPath: 'p.exe', args: [] });
+      assert.deepEqual(dm.relaunchOptions({ APPIMAGE: 'a.AppImage' }, '/tmp/mem0', ['/tmp/mem0', '--hidden']),
+        { execPath: 'a.AppImage', args: [] });
+      // 普通会话（无 --hidden、无便携变量）绝不返回重启参数
+      assert.equal(dm.relaunchOptions({}, '/opt/mem0/mem0', ['/opt/mem0/mem0', '--no-sandbox']), undefined);
+    });
     await t('5.5 relaunch', 'index.js 两处重启都走 relaunchOptions', () => {
       const main = fs.readFileSync(path.join(ROOT, 'src/main/index.js'), 'utf8');
       assert.equal((main.match(/app\.relaunch\(\);/g) || []).length, 1, '只应剩 relaunchApp 里的兜底调用');
       assert.match(main, /function relaunchApp\(\)[^}]*datamove\.relaunchOptions\(process\.env, process\.execPath, process\.argv\)/);
       assert.equal((main.match(/relaunchApp\(\); quitApp\(\);/g) || []).length, 2);
+    });
+  }
+
+  // =====================================================================
+  // 5.55 Windows 开机静默自启动（AC1.1 纯逻辑 + 接线 + 卸载残留）
+  // =====================================================================
+  {
+    const al = require(path.join(ROOT, 'src/main/autolaunch'));
+    const { createAutoLaunch, hasHiddenFlag } = al;
+    const REASON = '仅在 Windows 安装版中生效';
+    /** 假 app：登录项状态 / 是否忽略写入（模拟系统回读不一致） */
+    function fakeApp(opts = {}) {
+      const a = { isPackaged: opts.packaged !== false, on: !!opts.on, calls: [] };
+      a.getLoginItemSettings = (p) => {
+        a.calls.push(['get', p]);
+        return { openAtLogin: a.on, executableWillLaunchAtLogin: opts.willLaunch === false ? false : a.on };
+      };
+      a.setLoginItemSettings = (p) => { a.calls.push(['set', p]); if (!opts.ignoreSet) a.on = !!p.openAtLogin; };
+      return a;
+    }
+
+    await t('5.55 autolaunch', 'supported：仅 win32 为 true，其余平台一律 false 且不碰系统登录项', () => {
+      for (const p of ['darwin', 'linux']) {
+        const a = fakeApp();
+        const la = createAutoLaunch({ app: a, platform: p, env: {}, execPath: '/x/mem0' });
+        assert.equal(la.supported, false);
+        assert.deepEqual(la.get(), { supported: false, enabled: false });
+        assert.equal(a.calls.length, 0, '非 Windows 不调用 getLoginItemSettings');
+      }
+      const a = fakeApp();
+      const la = createAutoLaunch({ app: a, platform: 'win32', env: {}, execPath: 'C:\\Apps\\mem0.exe' });
+      assert.equal(la.supported, true);
+      assert.deepEqual(la.get(), { supported: true, enabled: false }, '默认关闭');
+      assert.deepEqual(a.calls.pop()[1], { path: 'C:\\Apps\\mem0.exe', args: ['--hidden'] });
+    });
+
+    await t('5.55 autolaunch', '打包 Windows：读写参数完全同构，写后回读一致', () => {
+      const a = fakeApp();
+      const la = createAutoLaunch({ app: a, platform: 'win32', env: {}, execPath: 'C:\\Apps\\mem0.exe' });
+      const r = la.set(true);
+      assert.deepEqual(r, { supported: true, enabled: true, ok: true, reason: '' });
+      const set = a.calls.find((c) => c[0] === 'set')[1];
+      assert.deepEqual(set, { openAtLogin: true, path: 'C:\\Apps\\mem0.exe', args: ['--hidden'] });
+      // 查询与写入的 path / args 必须完全同构（set 额外带 openAtLogin）
+      for (const c of a.calls.filter((x) => x[0] === 'get')) {
+        assert.deepEqual(c[1], { path: 'C:\\Apps\\mem0.exe', args: ['--hidden'] }, '读写必须同构');
+      }
+      assert.deepEqual(la.get(), { supported: true, enabled: true });
+      const off = la.set(false);
+      assert.deepEqual(off, { supported: true, enabled: false, ok: true, reason: '' });
+    });
+
+    await t('5.55 autolaunch', '未打包 / 便携版 / 非 Windows：开启不写注册表，返回原因并回弹', () => {
+      for (const [opts, env] of [
+        [{ packaged: false }, {}],
+        [{}, { PORTABLE_EXECUTABLE_FILE: 'C:\\portable\\mem0.exe' }],
+      ]) {
+        const a = fakeApp(opts);
+        const la = createAutoLaunch({ app: a, platform: 'win32', env, execPath: 'C:\\Apps\\mem0.exe' });
+        const r = la.set(true);
+        assert.deepEqual(r, { supported: true, enabled: false, ok: false, reason: REASON });
+        assert.equal(a.calls.length, 0, '不可安装环境不写注册表');
+      }
+      const a = fakeApp();
+      const la = createAutoLaunch({ app: a, platform: 'darwin', env: {}, execPath: '/x/mem0' });
+      assert.deepEqual(la.set(true), { supported: false, enabled: false, ok: false, reason: REASON });
+      // 关闭在不可安装环境本就是既成事实
+      assert.deepEqual(la.set(false), { supported: false, enabled: false, ok: true, reason: '' });
+    });
+
+    await t('5.55 autolaunch', '回读校验：写入后读不到 / executableWillLaunchAtLogin=false 都判关闭', () => {
+      const a = fakeApp({ ignoreSet: true });
+      const la = createAutoLaunch({ app: a, platform: 'win32', env: {}, execPath: 'C:\\Apps\\mem0.exe' });
+      const r = la.set(true);
+      assert.equal(r.ok, false);
+      assert.equal(r.enabled, false);
+      assert.ok(r.reason && r.reason.length > 0, '回读不一致要给原因');
+      const b = fakeApp({ willLaunch: false });
+      const lb = createAutoLaunch({ app: b, platform: 'win32', env: {}, execPath: 'C:\\Apps\\mem0.exe' });
+      assert.equal(lb.get().enabled, false, 'openAtLogin=true 但 executableWillLaunchAtLogin=false 视为关闭');
+    });
+
+    await t('5.55 autolaunch', 'hasHiddenFlag：只认启动参数里的 --hidden', () => {
+      assert.equal(hasHiddenFlag(['C:\\a.exe', '--hidden']), true);
+      assert.equal(hasHiddenFlag(['/a', '--no-sandbox', '--hidden']), true);
+      assert.equal(hasHiddenFlag(['C:\\a.exe']), false);
+      assert.equal(hasHiddenFlag(['--hidden-x']), false);
+      assert.equal(hasHiddenFlag(undefined), false);
+      assert.equal(hasHiddenFlag('--hidden'), false);
+      assert.equal(hasHiddenFlag([]), false);
+    });
+
+    await t('5.55 autolaunch', 'index.js 接线：--hidden 不建窗口、second-instance 静默返回、activate 前置主窗口', () => {
+      const main = fs.readFileSync(path.join(ROOT, 'src/main/index.js'), 'utf8');
+      assert.match(main, /const \{ createAutoLaunch, hasHiddenFlag \} = require\('\.\/autolaunch'\)/);
+      assert.match(main, /const autoLaunch = createAutoLaunch\(\{ app \}\)/);
+      assert.match(main, /const hiddenStart = hasHiddenFlag\(process\.argv\);\s*if \(!hiddenStart\) \{ createWindow\(\);/);
+      assert.match(main, /if \(hiddenStart\) \{[\s\S]*?bootLog\('hidden start: services without window'\);\s*afterLoad\(\);/);
+      assert.match(main, /app\.on\('second-instance', \(_ev, argv\) => \{ if \(hasHiddenFlag\(argv\)\) return; if \(popover\) popover\.hide\(\); openMain\(\); \}\)/);
+      assert.match(main, /app\.on\('activate', \(\) => \{ if \(popover\) popover\.hide\(\); openMain\(\); \}\)/);
+      assert.match(main, /ipcMain\.handle\('getAutoLaunch', guard\(\(\) => autoLaunch\.get\(\)\)\)/);
+      assert.match(main, /ipcMain\.handle\('setAutoLaunch', guard\(\(enabled\) => autoLaunch\.set\(enabled\)\)\)/);
+      assert.match(main, /autoLaunch: autoLaunch\.get\(\)/);
+    });
+
+    await t('5.55 autolaunch', 'preload / preview 同步暴露自启动读取与切换', () => {
+      const pre = fs.readFileSync(path.join(ROOT, 'src/preload/index.js'), 'utf8');
+      assert.match(pre, /getAutoLaunch: call\('getAutoLaunch'\)/);
+      assert.match(pre, /setAutoLaunch: call\('setAutoLaunch'\)/);
+      const preview = fs.readFileSync(path.join(ROOT, 'scripts/preview.js'), 'utf8');
+      assert.match(preview, /createAutoLaunch/);
+      assert.match(preview, /getLoginItemSettings/);
+      assert.match(preview, /setLoginItemSettings/);
+      assert.match(preview, /isPackaged: true/);
+      assert.match(preview, /autoLaunch: autoLaunch\.get\(\)/);
+    });
+
+    await t('5.55 autolaunch', 'installer.nsh：保留 customInit，新增 customUnInstall 删除两个 Run 键', () => {
+      const s = fs.readFileSync(path.join(ROOT, 'build/installer.nsh'), 'utf8');
+      assert.match(s, /!macro customInit/);
+      assert.match(s, /nsExec::Exec `taskkill \/F \/IM mem0\.exe \/T`/);
+      assert.match(s, /!macro customUnInstall/);
+      assert.match(s, /DeleteRegValue HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "electron\.app\.mem0"/);
+      assert.match(s, /DeleteRegValue HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "dev\.mem0\.desktop"/);
+      assert.match(s, /!macroend/);
     });
   }
 

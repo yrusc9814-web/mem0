@@ -23,6 +23,7 @@ const { startBridge } = require('../src/main/bridge');
 const { dataDir, sourceRoots } = require('../src/main/paths');
 const register = require('../src/main/register');
 const { TrayStats } = require('../src/main/stats');
+const { createAutoLaunch } = require('../src/main/autolaunch');
 
 const store = Store.open(dataDir());
 const ingestor = new LocalIngestor(store, sourceRoots(), { intervalMs: 60_000 });
@@ -139,8 +140,19 @@ if (!process.env.MEM0_PREVIEW_EMPTY) {
   const first = store.listConversations({ limit: 3 });
   for (const c of first) store.updateConversationMeta(c.id, { projectId: proj.id, summary: c === first[0] ? '定位到 413 后连接未关闭导致下一请求被重置，已加 connection: close。' : undefined });
 }
-const { AiOrganizer } = require('../src/main/ai-organizer');
+const { AiOrganizer, buildModelsUrl, apiModeFromBaseUrl, resolveEfforts } = require('../src/main/ai-organizer');
 const aiOrganizer = new AiOrganizer({ store });
+
+// 开机自启动假桩：界面预览没有真实 Electron，模拟一个「Windows 安装版」登录项，可读写同构参数
+let previewAutoLaunch = false;
+const previewAutoLaunchLog = [];
+const previewAutoLaunchApp = {
+  isPackaged: true,
+  getLoginItemSettings: (opts) => { previewAutoLaunchLog.push(['get', opts]); return { openAtLogin: previewAutoLaunch, executableWillLaunchAtLogin: previewAutoLaunch }; },
+  setLoginItemSettings: (opts) => { previewAutoLaunchLog.push(['set', opts]); previewAutoLaunch = !!opts.openAtLogin; },
+};
+// 预览平台可用 MEM0_PREVIEW_PLATFORM 覆盖（截图 / 调样式时模拟 win32 或 darwin 分支）
+const autoLaunch = createAutoLaunch({ app: previewAutoLaunchApp, platform: process.env.MEM0_PREVIEW_PLATFORM || process.platform, env: {} });
 
 (async () => {
   const services = { mcp: { ok: false, error: null, url: null }, bridge: { ok: false, error: null, url: null } };
@@ -165,6 +177,7 @@ const aiOrganizer = new AiOrganizer({ store });
     memoryGroups: [['个人与职业背景', 'user'], ['协作与沟通准则', 'shield'], ['环境与工作流', 'monitor'], ['踩坑与经验库', 'bulb']]
       .map(([id, ic]) => ({ id, icon: ic, copyLabel: '复制本页', presetTags: id === '踩坑与经验库' ? ['Windows', '网络', 'SQLite', '采集与前端'] : undefined })),
     ai: aiOrganizer.getPublicState(),
+    autoLaunch: autoLaunch.get(),
   });
   const withState = (o) => ({ ...(o || {}), state: fullState() });
   const trayState = () => {
@@ -190,6 +203,24 @@ const aiOrganizer = new AiOrganizer({ store });
     splitImportText: (raw, g) => aiOrganizer.splitImportWithAI(raw, g),
     saveAiConfig: (cfg) => { aiOrganizer.saveConfig(cfg || {}); return fullState(); },
     testAiConfig: async (cfg) => ({ ...(await aiOrganizer.testConfig(cfg || {})), state: fullState() }),
+    // 只读获取模型列表：预览没有真实 Key，返回演示列表（不发起外网请求）
+    fetchAiModels: async (cfg) => {
+      const input = cfg && typeof cfg === 'object' ? cfg : {};
+      const ai = aiOrganizer.getPublicState();
+      const baseUrl = String(input.baseUrl || ai.baseUrl || '');
+      const apiMode = input.apiMode === 'responses' || input.apiMode === 'chat_completions'
+        ? input.apiMode : apiModeFromBaseUrl(baseUrl, ai.apiMode);
+      const models = ['deepseek-chat', 'deepseek-reasoner', 'gpt-4o-mini', 'gpt-5.2', 'o3-mini', 'grok-3-mini', 'qwen2.5:7b', 'gemini-2.5-flash']
+        .map((id) => ({ id, endpointTypes: [], efforts: resolveEfforts({ modelId: id }), raw: { id, object: 'model', owned_by: 'preview' } }));
+      return { ok: true, models, count: models.length, apiMode, baseUrl, modelsUrl: buildModelsUrl(baseUrl), demo: true };
+    },
+    // 只读解析单个模型档位：预览无网络，只走第 2 级家族规则
+    resolveAiModelEfforts: async (cfg, modelId) => {
+      const input = cfg && typeof cfg === 'object' ? cfg : {};
+      const id = String(modelId || input.model || '');
+      if (!id) return { ok: false, modelId: '', efforts: null, error: '模型名称无效' };
+      return { ok: true, modelId: id, efforts: resolveEfforts({ modelId: id }), error: '' };
+    },
     organizeOld: async (o) => ({ ...(await aiOrganizer.organizeOldConversations(o || {})), state: fullState() }),
     exportMemoryPack: () => ({ ok: true, canceled: true }),
     importMemoryPack: () => ({ ok: true, canceled: true, state: fullState() }),
@@ -201,6 +232,8 @@ const aiOrganizer = new AiOrganizer({ store });
     pairCode: () => (bridge ? bridge.newPairCode() : null),
     revokeExtensions: () => fullState(),
     setTheme: (p) => p, copy: () => true, openDataDir: () => true, openUrl: () => true, changeDataDir: () => null, reportNav: () => true,
+    getAutoLaunch: () => autoLaunch.get(),
+    setAutoLaunch: (v) => autoLaunch.set(v),
     'tray.state': () => trayState(),
     'tray.rescan': logged('tray.rescan', async () => { await new Promise((r) => setTimeout(r, 300)); await ingestor.scanOnce(); return trayState(); }),
     'tray.resize': logged('tray.resize'),

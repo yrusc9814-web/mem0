@@ -33,6 +33,8 @@ const SRC = (p) => path.join(ROOT, 'src', p);
 const { computePosition, shouldIgnoreClick, shouldDestroyIdle, popoverOptions, TrayPopover, PANEL_WIDTH, INSET, BLUR_CLICK_GUARD_MS, READY_TIMEOUT_MS, REVEAL_TIMEOUT_MS, IDLE_DESTROY_MS } = require(SRC('main/tray-window'));
 const { TrayStats, startOfDay, TABLE } = require(SRC('main/stats'));
 const { Store } = require(SRC('main/db'));
+// 渲染层接口地址纯函数与主进程同规则：用后端 buildEndpoint 作为 URL 预览的对照基准
+const { buildEndpoint, resolveEfforts } = require(SRC('main/ai-organizer'));
 
 // ---------- 迷你测试框架 ----------
 const results = [];
@@ -59,7 +61,7 @@ const read = (p) => fs.readFileSync(path.join(ROOT, p), 'utf8');
 // 假 Electron
 // ======================================================================
 function makeFakeElectron({ trayBounds, cursor, display }) {
-  const log = { quit: 0, popUp: [], contextMenu: null };
+  const log = { quit: 0, popUp: [], contextMenu: null, loginGet: [], loginSet: [] };
   class WC extends EventEmitter {
     constructor() { super(); this.sent = []; this.loading = false; this.win = null; }
     send(ch, p) {
@@ -114,11 +116,18 @@ function makeFakeElectron({ trayBounds, cursor, display }) {
   const ready = new Promise((r) => { readyResolve = r; });
   const fake = {
     trayBounds, cursor, display, log, handlers, BrowserWindow, Tray, readyResolve, ipcListeners,
-    autoReady: true, readyHeight: undefined,
+    autoReady: true, readyHeight: undefined, loginOn: false,
     emitIpc: (ch, senderWc, payload) => { for (const fn of ipcListeners.get(ch) || []) fn({ sender: senderWc }, payload); },
     app: Object.assign(appEv, {
       requestSingleInstanceLock: () => true, getVersion: () => '0.5.0', getPath: () => path.join(T, 'userData'),
       whenReady: () => ready, quit: () => { log.quit++; }, exit: (code) => { log.exit = (log.exit || 0) + 1; log.exitCode = code; }, isQuitting: false,
+      // Windows 开机静默自启动桩：读写同构参数，登录项状态存在 fake.loginOn
+      isPackaged: true,
+      getLoginItemSettings: (opts) => {
+        log.loginGet.push(opts);
+        return { openAtLogin: !!fake.loginOn, executableWillLaunchAtLogin: !!fake.loginOn };
+      },
+      setLoginItemSettings: (opts) => { log.loginSet.push(opts); fake.loginOn = !!opts.openAtLogin; },
       dock: { visible: true, show() { this.visible = true; }, hide() { this.visible = false; } },
     }),
     powerMonitor: Object.assign(new EventEmitter(), {}),
@@ -337,7 +346,24 @@ function runAppRenderer() {
     remove: async (id) => { calls.remove.push(id); return true; }, copy: async (t) => { calls.copy.push(t); return true; },
     setSource: async () => stateImpl(), rescan: async () => stateImpl(), connectClient: async () => stateImpl(),
     disconnectClient: async () => stateImpl(), pairCode: async () => null, revokeExtensions: async () => stateImpl(),
+    // Windows 开机自动启动：默认成功（单测里按需替换成失败桩）
+    getAutoLaunch: async () => ({ supported: false, enabled: false }),
+    setAutoLaunch: async (v) => ({ supported: true, enabled: !!v, ok: true, reason: '' }),
     setTheme: () => {}, openDataDir: () => {}, changeDataDir: async () => null, openUrl: () => {}, reportNav: (n) => calls.reportNav.push(n),
+    // 只读获取模型列表桩：默认返回带端点类型与推理档位的演示列表（T4 / T6 交互测试按需替换）
+    fetchAiModels: async () => ({
+      ok: true, count: 2, apiMode: 'chat_completions', baseUrl: 'https://example.com/v1', modelsUrl: 'https://example.com/v1/models',
+      models: [
+        { id: 'mock-chat', endpointTypes: ['openai'], efforts: [], raw: { id: 'mock-chat', supported_endpoint_types: ['openai'] } },
+        { id: 'mock-reasoner', endpointTypes: [], efforts: ['low', 'medium', 'high'], raw: { id: 'mock-reasoner' } },
+      ],
+    }),
+    // 只读解析单个模型档位桩：走真实家族规则，保证与后端一致
+    resolveAiModelEfforts: async (cfg, modelId) => {
+      const input = cfg && typeof cfg === 'object' ? cfg : {};
+      const id = String(modelId || input.model || '');
+      return { ok: !!id, modelId: id, efforts: id ? resolveEfforts({ modelId: id }) : null, error: id ? '' : '模型名称无效' };
+    },
     onChanged: () => {}, onNavigate: () => {}, onMcpCalls: () => {},
   };
   const storage = new Map();
@@ -347,7 +373,7 @@ function runAppRenderer() {
     removeItem: (k) => storage.delete(String(k)),
   };
   const ctx = {
-    document: doc, mem0, localStorage, Node, El, Intl, Date, Promise, setTimeout, clearTimeout, console, CSS: { escape: (s) => s },
+    document: doc, mem0, localStorage, Node, El, URL, Intl, Date, Promise, setTimeout, clearTimeout, console, CSS: { escape: (s) => s },
     icon: () => new El('svg'), sourceLogo: () => new El('img'), brandMark: () => new El('img'),
     MEM0_SOURCES: {}, innerHeight: 900,
     matchMedia: () => ({ matches: false, addEventListener: () => {} }),
@@ -1401,6 +1427,123 @@ const W = PANEL_WIDTH + INSET * 2;
   await mac.shutdown();
 
   // ======================================================================
+  section('8b 双平台模拟：win32 / darwin 都跑真实 index.js（AC1.1 / AC1.2 / AC6.2）');
+  /**
+   * 只在本轮编译 / 启动期间把 process.platform 与 process.argv 切成目标平台，
+   * 用假 Electron 跑真实 src/main/index.js；返回假 Electron + 服务调用计数。
+   */
+  async function bootAs(platformName, argv) {
+    const prevPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const prevArgv = process.argv;
+    Object.defineProperty(process, 'platform', { value: platformName, configurable: true });
+    process.argv = argv;
+    const started = { mcp: 0, bridge: 0 };
+    const fake = makeFakeElectron({ trayBounds: { x: 1700, y: 1048, width: 24, height: 24 }, cursor: { x: 1, y: 1 }, display: DISPLAY });
+    const code = read('src/main/index.js');
+    const m = new Module(SRC('main/index.js'), module);
+    m.filename = SRC('main/index.js');
+    m.paths = Module._nodeModulePaths(path.dirname(SRC('main/index.js')));
+    const origLoad = Module._load;
+    Module._load = function (request, parent) {
+      if (request === 'electron') return fake;
+      if (request === './mcp') return { mcpEvents: new EventEmitter(), startMcpServer: async () => { started.mcp++; return { url: 'http://127.0.0.1:3790/mcp?token=t8', close: async () => {} }; } };
+      if (request === './bridge') return { startBridge: async () => { started.bridge++; return { url: 'ws://127.0.0.1:3791/browser/v1', status: () => ({ connected: 0, paired: 0 }), close: async () => {}, newPairCode: () => null, revokeAll: () => {} }; } };
+      if (parent && parent.filename === SRC('main/index.js') && request === './tray-window') {
+        const tw = origLoad.apply(this, arguments);
+        class TrackedPopover extends tw.TrayPopover { constructor(o) { super(o); fake.popover = this; } }
+        return { ...tw, TrayPopover: TrackedPopover };
+      }
+      return origLoad.apply(this, arguments);
+    };
+    try {
+      m._compile(code, SRC('main/index.js'));
+      fake.readyResolve();
+      await waitFor(() => fake.handlers.has('trayState'), 2000);
+      await sleep(40);
+    } finally {
+      Module._load = origLoad;
+      process.argv = prevArgv;
+      Object.defineProperty(process, 'platform', prevPlatform);
+    }
+    fake.started = started;
+    fake.tray = fake.Tray.last;
+    fake.mainWins = () => fake.BrowserWindow.all.filter((w) => !w.opts.transparent);
+    fake.invoke = (ch, ...args) => fake.handlers.get(ch)({ senderFrame: { url: 'file:///app/index.html' } }, ...args);
+    fake.shutdown = async () => { for (const l of fake.app.listeners('before-quit')) await l({ preventDefault() {} }); };
+    return fake;
+  }
+
+  const win32 = await bootAs('win32', ['C:\\Apps\\mem0.exe']);
+  await test('win32 模拟：托盘用彩色 tray.png、无应用菜单、不动 Dock', () => {
+    assert.equal(win32.mainWins().length, 1, '普通启动建一个主窗口');
+    assert.ok(win32.log.iconPath.endsWith(path.join('renderer', 'tray.png')), win32.log.iconPath);
+    assert.equal(win32.log.templateImage, undefined, 'Windows 不设模板图');
+    assert.equal(win32.log.appMenu, undefined, 'Windows 不装应用菜单');
+    assert.equal(win32.app.dock.visible, true, '非 macOS 不隐藏 Dock');
+  });
+  await test('win32 模拟：state.autoLaunch 默认关闭，且读 / 写登录项参数完全同构', () => {
+    assert.deepEqual(win32.invoke('state').autoLaunch, { supported: true, enabled: false });
+    assert.deepEqual(win32.invoke('getAutoLaunch'), { supported: true, enabled: false }, '默认关闭');
+    assert.ok(win32.log.loginGet.length > 0, '读取走真实 getLoginItemSettings');
+    const iso = { path: process.execPath, args: ['--hidden'] };
+    for (const p of win32.log.loginGet) assert.deepEqual(p, iso, '读登录项必须带 args（否则查询恒为 false）');
+    assert.equal(win32.app.isPackaged, true, '打包态才允许写注册表');
+  });
+  await test('win32 模拟：IPC 开启 → 写注册表并回读校验，state 同步；关闭同样回读', () => {
+    const r = win32.invoke('setAutoLaunch', true);
+    assert.deepEqual(r, { supported: true, enabled: true, ok: true, reason: '' });
+    assert.deepEqual(win32.log.loginSet[0], { openAtLogin: true, path: process.execPath, args: ['--hidden'] });
+    const iso = { path: process.execPath, args: ['--hidden'] };
+    for (const p of win32.log.loginGet) assert.deepEqual(p, iso, '写后回读参数与写入同构');
+    assert.deepEqual(win32.invoke('state').autoLaunch, { supported: true, enabled: true });
+    assert.deepEqual(win32.invoke('setAutoLaunch', false), { supported: true, enabled: false, ok: true, reason: '' });
+    assert.deepEqual(win32.log.loginSet[1], { openAtLogin: false, path: process.execPath, args: ['--hidden'] });
+    assert.deepEqual(win32.invoke('state').autoLaunch, { supported: true, enabled: false });
+  });
+  await test('win32 模拟：second-instance / activate 都前置主窗口（--hidden 除外，见下条）', async () => {
+    const w = win32.mainWins()[0];
+    w.hide();
+    win32.app.emit('second-instance', {}, ['C:\\Apps\\mem0.exe']);
+    await sleep(5);
+    assert.equal(w.visible, true, '普通二次启动前置主窗口');
+    w.hide();
+    win32.app.emit('activate');
+    await sleep(5);
+    assert.equal(w.visible, true, 'activate（点任务栏）也前置主窗口');
+    assert.equal(win32.mainWins().length, 1, '不重复建窗');
+  });
+  await test('--hidden 启动（win32）：零窗口，托盘与本地 MCP / 插件桥照常启动', async () => {
+    const hidden = await bootAs('win32', ['C:\\Apps\\mem0.exe', '--hidden']);
+    assert.equal(hidden.mainWins().length, 0, '--hidden 不建任何主窗口（零渲染进程）');
+    assert.ok(hidden.tray, '托盘常驻');
+    assert.ok(hidden.handlers.has('trayState'), '无窗口也照常注册 IPC');
+    await waitFor(() => hidden.started.mcp === 1 && hidden.started.bridge === 1, 2000);
+    // 开机后用户又手动启动一次（不带 --hidden）：不得因为第二次是 --hidden 就静默，反之亦然
+    hidden.app.emit('second-instance', {}, ['C:\\Apps\\mem0.exe', '--hidden']);
+    await sleep(20);
+    assert.equal(hidden.mainWins().length, 0, '带 --hidden 的 second-instance 静默返回');
+    hidden.app.emit('second-instance', {}, ['C:\\Apps\\mem0.exe']);
+    await sleep(20);
+    assert.equal(hidden.mainWins().length, 1, '普通 second-instance 仍前置主窗口');
+    await hidden.shutdown();
+  });
+  const darwin = await bootAs('darwin', ['/Applications/mem0.app/Contents/MacOS/mem0']);
+  await test('darwin 模拟：自启动恒为不支持，且从不读写系统登录项', () => {
+    assert.deepEqual(darwin.invoke('getAutoLaunch'), { supported: false, enabled: false });
+    assert.deepEqual(darwin.invoke('state').autoLaunch, { supported: false, enabled: false });
+    assert.deepEqual(darwin.invoke('setAutoLaunch', true), { supported: false, enabled: false, ok: false, reason: '仅在 Windows 安装版中生效' });
+    assert.equal(darwin.log.loginGet.length, 0, 'darwin 绝不读登录项');
+    assert.equal(darwin.log.loginSet.length, 0, 'darwin 绝不写登录项');
+  });
+  await test('darwin 模拟：模板托盘图标 + 应用菜单（与 win32 分支互不干扰）', () => {
+    assert.ok(darwin.log.iconPath.endsWith(path.join('assets', 'trayTemplate.png')), darwin.log.iconPath);
+    assert.equal(darwin.log.templateImage, true);
+    assert.ok(darwin.log.appMenu, 'macOS 装应用菜单');
+  });
+  await darwin.shutdown();
+  await win32.shutdown();
+
+  // ======================================================================
   section('9 会话详情分页 / 复制时才取全文 / 删除时清理大纲（vm 里跑真实 app.js）');
   const A = runAppRenderer();
   const detailActions = () => A.byClass(A.el('detail'), 'detail-actions')[0];
@@ -1672,7 +1815,7 @@ const W = PANEL_WIDTH + INSET * 2;
     services: { mcp: { ok: true, starting: false, url: 'http://127.0.0.1:3790/mcp?token=t' }, bridge: { ok: true, starting: false, url: 'ws://x' } },
     clients: [], mcpCallsToday: 0, dataDir: '/tmp', version: '0.6.0', manualConfig: '{}',
     memories: [], projects: [], memoryGroups: MEM_GROUPS,
-    ai: { enabled: true, provider: 'deepseek', baseUrl: '', model: '', hasKey: false, keyHint: '', statusText: '已就绪', statusOk: true, unorganizedCount: 0, organizing: false },
+    ai: { enabled: true, provider: 'deepseek', baseUrl: '', model: '', apiMode: 'chat_completions', reasoningEffort: '', hasKey: false, keyHint: '', statusText: '已就绪', statusOk: true, unorganizedCount: 0, organizing: false },
     ...over,
   });
   const setFullState = (over = {}) => A.ev(`state = ${JSON.stringify(baseState(over))}`);
@@ -1840,6 +1983,548 @@ const W = PANEL_WIDTH + INSET * 2;
   });
 
   // ======================================================================
+  section('10d 设置页「常规与外观 → 开机自动启动」（vm 里真实 app.js）');
+  // 假 DOM 不解析 index.html：这里补一个「主题」行探针，用来断言自启动行插在它上方
+  A.ev(`(() => {
+    const box = document.querySelector('#settings-appearance');
+    const t = document.createElement('div');
+    t.className = 'grow'; t.id = 'theme-row';
+    box.append(t);
+  })()`);
+  const alRow = () => A.all(A.el('settings-appearance')).filter((n) => n.id === 'autolaunch-row')[0] || null;
+  const alSwitch = () => { const r = alRow(); return r ? A.byClass(r, 'switch')[0] || null : null; };
+  const alInput = () => { const s = alSwitch(); return s ? s.children[0] : null; };
+  const clearToasts = () => { for (const n of A.byClass(A.ctx.document.body, 'toast')) n.remove(); };
+
+  await test('index.html：外观卡片有标题 id / 卡片 id，开机自动启动行由渲染层按平台插入（静态 HTML 不预置）', () => {
+    const html = read('src/renderer/index.html');
+    assert.match(html, /<h3 id="settings-appearance-hd">外观<\/h3>/);
+    assert.match(html, /<div class="group" id="settings-appearance">/);
+    assert.ok(!html.includes('开机自动启动'), '静态 HTML 不得预置该行（非 Windows 要完全不渲染）');
+    assert.ok(!html.includes('开机后静默驻留托盘'), '副文案只在渲染层按平台输出');
+    assert.doesNotMatch(html, /\sstyle=/i);
+  });
+
+  await test('Windows（supported=true）：「外观」标题显示「常规与外观」，同卡片「主题」上方渲染开机自动启动行', () => {
+    setFullState({ autoLaunch: { supported: true, enabled: false } });
+    A.ctx.renderSettings();
+    assert.equal(A.el('settings-appearance-hd').textContent, '常规与外观');
+    const row = alRow();
+    assert.ok(row, '应渲染 #autolaunch-row');
+    const box = A.el('settings-appearance');
+    assert.equal(box.children[0], row, '该行在卡片第一位（「主题」上方）');
+    assert.equal(box.children[1].id, 'theme-row', '「主题」行紧随其后');
+    const t = A.text(row);
+    assert.ok(t.includes('开机自动启动'), t);
+    assert.ok(t.includes('开机后静默驻留托盘，自动备份对话并运行本地 MCP 服务'), t);
+    const sw = A.byClass(row, 'switch');
+    assert.equal(sw.length, 1, '右侧复用现有 .switch 开关');
+    assert.equal(sw[0].attrs.title, '开机自动启动');
+    assert.equal(A.byClass(row, 'end')[0].children[0], sw[0], '开关在 .end 右侧');
+    assert.equal(sw[0].children[0].attrs.type, 'checkbox');
+    assert.equal(sw[0].children[0].checked, false, '默认关闭');
+    assertNoBadText('设置页外观区（Windows）');
+  });
+
+  await test('Windows 已开启：开关为勾选态', () => {
+    setFullState({ autoLaunch: { supported: true, enabled: true } });
+    A.ctx.renderSettings();
+    assert.equal(alInput().checked, true);
+    assert.equal(A.byClass(alRow(), 'switch').length, 1, '状态推送不重复插入该行');
+  });
+
+  await test('非 Windows（supported=false）：完全不渲染该行，标题仍为「外观」', () => {
+    setFullState({ autoLaunch: { supported: false, enabled: false } });
+    A.ctx.renderSettings();
+    assert.equal(A.el('settings-appearance-hd').textContent, '外观');
+    assert.equal(alRow(), null, '该行应从 DOM 移除');
+    assert.equal(A.byClass(A.el('settings-appearance'), 'switch').length, 0, '卡片内不残留开关');
+    assert.ok(!A.text(A.el('settings-appearance')).includes('开机自动启动'));
+    assert.deepEqual(A.el('settings-appearance').children.map((n) => n.id), ['theme-row'], '卡片里只剩「主题」');
+  });
+
+  await test('平台真值：win32 的 autoLaunch.get() 渲染「常规与外观」行，darwin 的 get() 完全不渲染', () => {
+    const { createAutoLaunch } = require(SRC('main/autolaunch'));
+    const app = {
+      isPackaged: true, open: false,
+      getLoginItemSettings: () => ({ openAtLogin: app.open, executableWillLaunchAtLogin: app.open }),
+      setLoginItemSettings: (o) => { app.open = !!o.openAtLogin; },
+    };
+    const win32 = createAutoLaunch({ app, platform: 'win32', env: {}, execPath: 'C:\\Apps\\mem0.exe' });
+    assert.deepEqual(win32.get(), { supported: true, enabled: false });
+    setFullState({ autoLaunch: win32.get() });
+    A.ctx.renderSettings();
+    assert.ok(alRow(), 'win32：渲染开机自动启动行');
+    assert.equal(A.el('settings-appearance-hd').textContent, '常规与外观');
+
+    // darwin 分支连登录项都不碰：get() 返回 supported=false，界面必须完全不渲染该行
+    const touch = () => { throw new Error('darwin 不得读写系统登录项'); };
+    const mac = createAutoLaunch({ app: { isPackaged: true, getLoginItemSettings: touch, setLoginItemSettings: touch }, platform: 'darwin', env: {}, execPath: '/Applications/mem0.app' });
+    assert.deepEqual(mac.get(), { supported: false, enabled: false });
+    setFullState({ autoLaunch: mac.get() });
+    A.ctx.renderSettings();
+    assert.equal(alRow(), null, 'darwin：完全不渲染该行');
+    assert.equal(A.el('settings-appearance-hd').textContent, '外观', 'macOS 标题保持「外观」');
+    assert.deepEqual(A.el('settings-appearance').children.map((n) => n.id), ['theme-row']);
+    assertNoBadText('设置页外观区（darwin 真值）');
+  });
+
+  await test('state 里没有 autoLaunch（旧状态 / 未接线）同样不渲染该行，标题「外观」', () => {
+    setFullState();
+    A.ctx.renderSettings();
+    assert.equal(A.el('settings-appearance-hd').textContent, '外观');
+    assert.equal(alRow(), null);
+    assert.deepEqual(A.el('settings-appearance').children.map((n) => n.id), ['theme-row']);
+  });
+
+  await test('开启失败：开关回弹，toast 显示后端返回的原因', async () => {
+    setFullState({ autoLaunch: { supported: true, enabled: false } });
+    A.ctx.renderSettings();
+    clearToasts();
+    A.ctx.mem0.setAutoLaunch = async () => ({ supported: true, enabled: false, ok: false, reason: '仅在 Windows 安装版中生效' });
+    const input = alInput();
+    input.checked = true; // 模拟浏览器先把开关拨到开，再派发 change
+    await input.dispatch('change', { target: input });
+    assert.equal(input.checked, false, '失败后开关回弹到关闭');
+    const toasts = A.byClass(A.ctx.document.body, 'toast');
+    assert.equal(toasts.length, 1, '应弹出一条 toast');
+    assert.equal(A.text(toasts[0]), '仅在 Windows 安装版中生效');
+    assert.equal(A.el('settings-appearance-hd').textContent, '常规与外观', '失败不影响该行展示');
+    assertNoBadText('设置页外观区（开启失败）');
+  });
+
+  await test('开启成功：开关保持勾选、无失败提示，state.autoLaunch 同步为开启', async () => {
+    setFullState({ autoLaunch: { supported: true, enabled: false } });
+    A.ctx.renderSettings();
+    clearToasts();
+    A.ctx.mem0.setAutoLaunch = async () => ({ supported: true, enabled: true, ok: true, reason: '' });
+    const input = alInput();
+    input.checked = true;
+    await input.dispatch('change', { target: input });
+    assert.equal(input.checked, true);
+    assert.equal(A.byClass(A.ctx.document.body, 'toast').length, 0, '成功不弹提示');
+    assert.deepEqual(A.plain(A.ev('state.autoLaunch')), { supported: true, enabled: true });
+  });
+
+  await test('该行零内联样式：DOM 无 style 属性 / 样式对象 / 内联事件，源码无 style="…" 与 insertAdjacentHTML', () => {
+    setFullState({ autoLaunch: { supported: true, enabled: true } });
+    A.ctx.renderSettings();
+    const nodes = A.all(alRow());
+    assert.ok(nodes.length >= 5, '应渲染出完整的一行');
+    for (const n of nodes) {
+      assert.equal('style' in n.attrs, false, `${n.tag} 不得写 style 属性`);
+      assert.deepEqual(Object.keys(n.style || {}), [], `${n.tag} 不得用 el.style 赋值`);
+      assert.ok(!Object.keys(n.attrs).some((k) => /^on/i.test(k)), `${n.tag} 不得写内联事件`);
+    }
+    const strip = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    const js = strip(read('src/renderer/app.js'));
+    assert.doesNotMatch(js, /\bstyle\s*=\s*["']/);
+    assert.doesNotMatch(js, /insertAdjacentHTML/);
+    assert.doesNotMatch(js, /setAttribute\(\s*['"]style/);
+    // 样式只写进现有 css：开关沿用 .switch，无新配色
+    const css = read('src/renderer/style.css');
+    assert.match(css, /\.switch\s*\{[^}]*width:\s*36px;\s*height:\s*21px/);
+    assert.match(css, /\.switch input:checked \+ span\s*\{[^}]*background:\s*var\(--accent\)/);
+  });
+
+  // ======================================================================
+  section('10e 设置页「AI 自动整理」双协议 / URL 预览 / 获取模型（vm 里真实 app.js + memory.js）');
+  const aiBox = () => A.el('settings-ai');
+  const aiNodes = (cls) => A.byClass(aiBox(), cls);
+  const urlInput = () => aiNodes('ai-url-field')[0].children.find((n) => n.tag === 'input');
+  const modelInput = () => aiNodes('ai-model-field')[0].children[1].children[0];
+  const keyInput = () => aiNodes('ai-key-field')[0].children[1].children[0];
+  const fetchBtn = () => aiNodes('ai-fetch-btn')[0];
+  const presetPill = (label) => aiNodes('ai-preset-row')[0].children.find((b) => b.tag === 'button' && A.text(b) === label);
+  const modePill = (label) => aiNodes('ai-mode-pills')[0].children.find((b) => A.text(b) === label);
+  const modelPop = () => aiNodes('ai-model-pop')[0];
+  const modelRows = () => A.byClass(modelPop(), 'mi');
+  const previewText = () => aiNodes('ai-url-preview')[0].textContent;
+  const aiState = (over = {}) => ({ ...baseState().ai, hasKey: true, keyHint: 'sk-••••3456', ...over });
+  /** 与真实交互一致：先渲染设置页，再点一次预设胶囊（重置草稿 provider / 地址 / 模型） */
+  const renderAi = async (ai = {}, presetLabel = 'OpenAI 兼容 / 中转') => {
+    setFullState({ ai: aiState(ai) });
+    A.ev('window.mem0Ext.renderAll()');
+    const pill = presetPill(presetLabel);
+    assert.ok(pill, `应有 ${presetLabel} 预设胶囊`);
+    await pill.click();
+    await modePill('Chat Completions').click(); // 归一化草稿协议，避免用例之间相互影响
+    await tick2(); // 等只读档位解析落地
+  };
+  const typeIn = async (el, v) => { el.value = v; await el.dispatch('input', { target: el }); };
+  const tick2 = () => new Promise((r) => setTimeout(r, 0));
+  const stripJs = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  // 推理档位（AC4.3）交互探针
+  const effortBox = () => aiNodes('ai-effort')[0];
+  const effortPills = () => A.byClass(effortBox(), 'ai-effort-pills')[0] || null;
+  const effortPill = (label) => {
+    const row = effortPills();
+    return row ? row.children.find((b) => b.tag === 'button' && A.text(b) === label) || null : null;
+  };
+  const effortHint = () => A.byClass(effortBox(), 'ai-effort-hint')[0];
+  const effortCustomBtn = () => A.all(effortBox()).find((n) => n.tag === 'button' && /^自定义档位/.test(A.text(n))) || null;
+  const effortCustomInput = () => A.byClass(effortBox(), 'ai-effort-input')[0] || null;
+  const setModel = async (id) => { await typeIn(modelInput(), id); await tick2(); };
+
+  await test('接口地址同组渲染 Chat Completions / Responses 协议胶囊与等宽灰字 URL 预览（静态 HTML 不预置）', async () => {
+    await renderAi();
+    const pills = aiNodes('ai-mode-pills')[0];
+    assert.ok(pills, '应有协议胶囊组');
+    assert.deepEqual(pills.children.map((b) => A.text(b)), ['Chat Completions', 'Responses']);
+    assert.equal(pills.attrs.role, 'group');
+    assert.equal(pills.attrs['aria-label'], '接口协议');
+    assert.ok(aiNodes('ai-url-field')[0].children[0].children.includes(pills), '胶囊与地址输入框同组');
+    assert.ok(aiNodes('ai-url-preview')[0], '地址框下方应有 URL 预览');
+    assert.equal(aiNodes('ai-url-preview')[0], aiNodes('ai-url-field')[0].children[2], '预览紧跟在地址输入框之后');
+    assert.equal(modePill('Chat Completions')._cls.has('on'), true, '默认 chat_completions');
+    assert.equal(previewText(), 'https://api.openai.com/v1/chat/completions');
+    const html = read('src/renderer/index.html');
+    assert.ok(!html.includes('Chat Completions'), '静态 HTML 不得预置协议胶囊');
+    assert.ok(!html.includes('获取模型'), '静态 HTML 不得预置获取模型按钮');
+    assert.doesNotMatch(html, /datalist/i);
+    assertNoBadText('设置页 AI 区（初始）');
+  });
+
+  await test('URL 预览实时回显最终请求 URL，且与主进程 buildEndpoint 规则一致（含 # 锁定与 ?api-version=）', async () => {
+    const cases = [
+      ['https://api.deepseek.com', 'https://api.deepseek.com/v1/chat/completions'],
+      ['https://api.deepseek.com/v1/', 'https://api.deepseek.com/v1/chat/completions'],
+      ['https://host#', 'https://host/chat/completions'],
+      ['https://host/custom/endpoint#', 'https://host/custom/endpoint'],
+      ['https://host/v1/chat/completions', 'https://host/v1/chat/completions'],
+      ['https://host/openai/deployments/d?api-version=2024-02-01', 'https://host/openai/deployments/d/chat/completions?api-version=2024-02-01'],
+      ['http://127.0.0.1:11434', 'http://127.0.0.1:11434/v1/chat/completions'],
+    ];
+    await renderAi();
+    for (const [input, expected] of cases) {
+      await typeIn(urlInput(), input);
+      assert.equal(previewText(), expected, input);
+      assert.equal(previewText(), buildEndpoint(input, 'chat_completions'), `${input} 应与主进程同规则`);
+    }
+    await typeIn(urlInput(), 'not a url');
+    assert.equal(previewText(), '接口地址无效，请填写 http(s) 开头的完整地址');
+    assertNoBadText('设置页 AI 区（预览）');
+  });
+
+  await test('输入以 /responses 结尾的地址自动切到 Responses 胶囊；输入 /chat/completions 自动切回', async () => {
+    await renderAi();
+    assert.equal(modePill('Chat Completions')._cls.has('on'), true);
+    await typeIn(urlInput(), 'https://relay.test/v1/responses');
+    assert.equal(modePill('Responses')._cls.has('on'), true);
+    assert.equal(modePill('Chat Completions')._cls.has('on'), false);
+    assert.equal(previewText(), 'https://relay.test/v1/responses');
+    await typeIn(urlInput(), 'https://relay.test/v1/chat/completions');
+    assert.equal(modePill('Chat Completions')._cls.has('on'), true);
+    assert.equal(previewText(), 'https://relay.test/v1/chat/completions');
+    // 地址不含协议后缀时保持当前选择，绝不猜
+    await modePill('Responses').click();
+    await typeIn(urlInput(), 'https://relay.test/v2');
+    assert.equal(modePill('Responses')._cls.has('on'), true);
+    assert.equal(previewText(), 'https://relay.test/v2/responses');
+    assertNoBadText('设置页 AI 区（协议对齐）');
+  });
+
+  await test('手点 Responses 胶囊立即改协议并同步 URL 预览；第三方中转地址不被盲目暗切', async () => {
+    await renderAi();
+    await modePill('Responses').click();
+    assert.equal(modePill('Responses')._cls.has('on'), true);
+    assert.equal(modePill('Responses').attrs['aria-pressed'], 'true');
+    assert.equal(modePill('Chat Completions').attrs['aria-pressed'], 'false');
+    assert.equal(previewText(), 'https://api.openai.com/v1/responses');
+    await modePill('Chat Completions').click();
+    assert.equal(previewText(), 'https://api.openai.com/v1/chat/completions');
+  });
+
+  await test('点 DeepSeek / Gemini Flash / 本地 Ollama 预设胶囊：切回 Chat Completions 并同步地址与模型', async () => {
+    for (const [label, baseUrl] of [['DeepSeek', 'https://api.deepseek.com/v1'], ['Gemini Flash', 'https://generativelanguage.googleapis.com/v1beta/openai'], ['本地 Ollama（免 Key）', 'http://127.0.0.1:11434/v1']]) {
+      await renderAi();
+      await modePill('Responses').click();
+      assert.equal(modePill('Responses')._cls.has('on'), true);
+      await presetPill(label).click();
+      assert.equal(modePill('Chat Completions')._cls.has('on'), true, `${label} 应切回 chat_completions`);
+      assert.equal(urlInput().value, baseUrl, label);
+      assert.equal(previewText(), `${baseUrl}/chat/completions`, label);
+    }
+    assertNoBadText('设置页 AI 区（预设胶囊）');
+  });
+
+  await test('模型输入框旁 [获取模型]：用现有 .pop.menu 浮层展示列表，可点选回填模型与协议', async () => {
+    await renderAi();
+    const btn = fetchBtn();
+    assert.ok(btn, '应有 [获取模型] 按钮');
+    assert.equal(btn.tag, 'button');
+    assert.ok(btn._cls.has('btn'), '沿用现有 .btn 样式');
+    assert.ok(modelPop()._cls.has('pop') && modelPop()._cls.has('menu'), '浮层必须是现有 .pop.menu');
+    assert.ok(modelPop()._cls.has('hidden'), '默认收起');
+    assert.equal(modelPop().attrs.role, 'listbox');
+    await btn.click();
+    await tick2();
+    assert.equal(modelPop()._cls.has('hidden'), false, '获取成功后应展开浮层');
+    assert.deepEqual(modelRows().map((r) => A.text(r)), ['mock-chat', 'mock-reasoner']);
+    assert.equal(A.text(A.byClass(A.ctx.document.body, 'toast')[0]), '已获取 2 个模型');
+    // 仅含 'openai' 端点类型 → 自动切回 chat_completions（AC2.3）
+    await modePill('Responses').click();
+    await btn.click();
+    await tick2();
+    assert.equal(modePill('Chat Completions')._cls.has('on'), true, '仅 openai 端点类型的列表应切回 chat_completions');
+    await modelRows()[0].click();
+    assert.equal(modelInput().value, 'mock-chat', '点选后回填模型输入框');
+    assert.equal(modelPop()._cls.has('hidden'), true, '点选后收起浮层');
+    assertNoBadText('设置页 AI 区（获取模型）');
+  });
+
+  await test('浮层内输入过滤：关键字筛选模型行，未命中显示空态；模型名仍可自由手输', async () => {
+    await renderAi();
+    await fetchBtn().click();
+    await tick2();
+    const filter = A.byClass(modelPop(), 'pop-inline-input')[0].children[0];
+    assert.equal(filter.tag, 'input');
+    await typeIn(filter, 'reason');
+    assert.deepEqual(modelRows().map((r) => A.text(r)), ['mock-reasoner']);
+    await typeIn(filter, 'zzz');
+    assert.equal(modelRows().length, 0);
+    assert.equal(A.text(aiNodes('ai-model-empty')[0]), '没有匹配的模型');
+    await typeIn(filter, '');
+    assert.equal(modelRows().length, 2);
+    await typeIn(modelInput(), 'my-custom-model');
+    assert.equal(modelInput().value, 'my-custom-model', '模型名可自由手输');
+    assert.equal(modelInput().tag, 'input');
+    assert.equal('list' in modelInput().attrs, false, '不得用原生 datalist 关联');
+    assertNoBadText('设置页 AI 区（模型过滤）');
+  });
+
+  await test('获取模型失败：toast 展示后端错误，不展开浮层、不污染配置', async () => {
+    await renderAi();
+    clearToasts();
+    let saved = 0;
+    const realSave = A.ctx.mem0.saveAiConfig;
+    A.ctx.mem0.saveAiConfig = async () => { saved++; return A.ctx.state; };
+    A.ctx.mem0.fetchAiModels = async () => ({ ok: false, models: [], apiMode: 'chat_completions', error: 'HTTP 401 Unauthorized' });
+    await fetchBtn().click();
+    await tick2();
+    assert.equal(modelPop()._cls.has('hidden'), true, '失败不展开浮层');
+    assert.equal(A.text(A.byClass(A.ctx.document.body, 'toast')[0]), '获取模型失败：HTTP 401 Unauthorized');
+    assert.equal(A.byClass(A.ctx.document.body, 'toast').length, 1);
+    assert.equal(saved, 0, '获取模型绝不落盘配置');
+    A.ctx.mem0.saveAiConfig = realSave;
+    assertNoBadText('设置页 AI 区（获取失败）');
+  });
+
+  await test('Key placeholder：域名与已保存不同时提示「接口域名已变更，请输入对应 API Key」，同域恢复原提示', async () => {
+    await renderAi({ baseUrl: 'https://saved.test/v1' });
+    assert.equal(keyInput().placeholder, '接口域名已变更，请输入对应 API Key', '预设地址与已保存域名不同');
+    await typeIn(urlInput(), 'https://saved.test/v1');
+    const same = keyInput().placeholder;
+    assert.match(same, /已保存 sk-••••3456，留空则沿用/);
+    await typeIn(urlInput(), 'https://saved.test/v2');
+    assert.equal(keyInput().placeholder, same, '同域名（仅路径变化）恢复原提示');
+    await typeIn(urlInput(), 'https://other.test/v1');
+    assert.equal(keyInput().placeholder, '接口域名已变更，请输入对应 API Key');
+    await renderAi({ baseUrl: 'https://saved.test/v1', hasKey: false });
+    await typeIn(urlInput(), 'https://other.test/v1');
+    assert.equal(keyInput().placeholder, '粘贴 API Key（只加密保存在本机）');
+    await renderAi({ baseUrl: 'http://127.0.0.1:11434/v1' }, '本地 Ollama（免 Key）');
+    assert.equal(keyInput().placeholder, '本地模型无需 Key');
+    assertNoBadText('设置页 AI 区（Key 提示）');
+  });
+
+  await test('局部 DOM 刷新：打字时 URL 预览与协议胶囊就地更新，<input> 节点不重建（保留焦点守卫）', async () => {
+    await renderAi();
+    const before = { url: urlInput(), model: modelInput(), key: keyInput(), pills: aiNodes('ai-mode-pills')[0], preview: aiNodes('ai-url-preview')[0] };
+    const pop = modelPop();
+    await typeIn(urlInput(), 'https://relay.test/v1/responses');
+    assert.equal(urlInput(), before.url, '地址输入框节点必须原地保留');
+    assert.equal(modelInput(), before.model, '模型输入框节点必须原地保留');
+    assert.equal(keyInput(), before.key, 'Key 输入框节点必须原地保留');
+    assert.equal(aiNodes('ai-mode-pills')[0], before.pills, '协议胶囊节点不重建');
+    assert.equal(aiNodes('ai-url-preview')[0], before.preview, 'URL 预览节点不重建');
+    assert.equal(modelPop(), pop, '模型浮层节点不重建');
+    assert.equal(previewText(), 'https://relay.test/v1/responses');
+    // 焦点守卫：正在输入时后台状态推送不重建设置区
+    const box = aiBox();
+    const count = A.all(box).length;
+    box.contains = () => true;
+    A.ctx.document.activeElement = { tagName: 'INPUT' };
+    A.ev('window.mem0Ext.renderAll()');
+    assert.equal(A.all(aiBox()).length, count, '输入框聚焦时后台推送不重建节点');
+    assert.equal(urlInput(), before.url, '地址输入框仍是同一个节点');
+    delete box.contains;
+    A.ctx.document.activeElement = null;
+  });
+
+  await test('CSP：AI 设置区零内联样式 / 零 insertAdjacentHTML / 零 datalist，样式只写在现有 css', async () => {
+    await renderAi();
+    for (const n of A.all(aiBox())) {
+      assert.equal('style' in n.attrs, false, `${n.tag} 不得写 style 属性`);
+      assert.deepEqual(Object.keys(n.style || {}), [], `${n.tag} 不得用 el.style 赋值`);
+      assert.ok(!Object.keys(n.attrs).some((k) => /^on/i.test(k)), `${n.tag} 不得写内联事件`);
+    }
+    const js = stripJs(read('src/renderer/memory.js'));
+    assert.doesNotMatch(js, /\bstyle\s*=\s*["']/);
+    assert.doesNotMatch(js, /insertAdjacentHTML/);
+    assert.doesNotMatch(js, /setAttribute\(\s*['"]style/);
+    assert.doesNotMatch(js, /\.style\./);
+    assert.doesNotMatch(read('src/renderer/index.html'), /datalist/i);
+    const css = read('src/renderer/memory-clean.css');
+    assert.match(css, /\.ai-url-preview\s*\{[^}]*font-family:\s*var\(--font-mono\)/);
+    assert.match(css, /\.ai-url-preview\s*\{[^}]*color:\s*var\(--muted\)/);
+    assert.match(css, /\.ai-mode-pills\s*\{[^}]*display:\s*inline-flex/);
+  });
+
+  await test('全视图无裸 "null" / "undefined" / "false"：设置页（含浮层展开态）与记忆页', async () => {
+    await renderAi();
+    await fetchBtn().click();
+    await tick2();
+    assertNoBadText('设置页 AI 区（浮层展开）');
+    setFullState({
+      memories: [{ id: 'm1', group: '个人与职业背景', title: '背景一', body: '正文一', tags: [], sourceIds: [], originLabel: '手动录入', superseded: '', updatedAt: 1_700_000_000_000 }],
+    });
+    A.ev('window.mem0Ext.openMemory({ type: "group", id: "个人与职业背景" })');
+    assertNoBadText('记忆页（AI 设置同屏）');
+    A.ev('window.mem0Ext.renderAll()');
+    assertNoBadText('设置页 AI 区（重绘后）');
+  });
+
+  // ======================================================================
+  section('10f 设置页「推理档位」胶囊 / 折叠 / 自定义直通 / LRU 记忆（vm 里真实 app.js + memory.js）');
+  const clearEffortMemory = () => A.ctx.localStorage.removeItem('mem0.aiEffortMemory');
+  const effortLine = () => A.byClass(effortBox(), 'ai-effort-line')[0] || null;
+
+  await test('有档位模型：胶囊行 [默认] + 原生档位 + [自定义…]，默认选中且提示行隐藏', async () => {
+    clearEffortMemory();
+    await renderAi();
+    await setModel('gpt-5.2');
+    const row = effortPills();
+    assert.ok(row, '有档位模型应渲染胶囊行');
+    assert.deepEqual(row.children.map((b) => A.text(b)), ['默认', 'none', 'low', 'medium', 'high', 'xhigh', '自定义…']);
+    assert.equal(effortPill('默认')._cls.has('on'), true, '默认档位默认选中');
+    assert.equal(effortPill('默认').attrs['aria-pressed'], 'true');
+    assert.equal(effortPill('high')._cls.has('on'), false);
+    assert.equal(effortHint()._cls.has('hidden'), true, '默认档位不显示高消耗提示');
+    assertNoBadText('推理档位（有档位模型）');
+  });
+
+  await test('选 high / xhigh 显示淡提示「后台耗时与 Token 消耗更多」，选 medium / 默认隐藏，不阻拦保存', async () => {
+    clearEffortMemory();
+    await renderAi();
+    await setModel('gpt-5.2');
+    for (const level of ['high', 'xhigh']) {
+      await effortPill(level).click();
+      assert.equal(effortPill(level)._cls.has('on'), true, level);
+      assert.equal(effortHint()._cls.has('hidden'), false, `${level} 应显示提示`);
+      assert.match(A.text(effortHint()), /后台耗时与 Token 消耗更多/);
+    }
+    await effortPill('medium').click();
+    assert.equal(effortHint()._cls.has('hidden'), true, 'medium 不提示');
+    await effortPill('high').click();
+    // 保存 payload 原样带上开放字符串档位（不阻拦、不裁剪）
+    let savedCfg = null;
+    const realTest = A.ctx.mem0.testAiConfig;
+    A.ctx.mem0.testAiConfig = async (cfg) => { savedCfg = cfg; return { ok: true, latencyMs: 12, state: A.ctx.state }; };
+    await aiNodes('ai-test-btn')[0].click();
+    await tick2();
+    A.ctx.mem0.testAiConfig = realTest;
+    assert.ok(savedCfg, '应调用 testAiConfig 保存');
+    assert.equal(savedCfg.reasoningEffort, 'high');
+    assert.equal(savedCfg.model, 'gpt-5.2');
+    assertNoBadText('推理档位（高消耗提示）');
+  });
+
+  await test('无档位 / 未知模型折叠为一行「推理档位：默认（不指定） [自定义档位 ▾]」，点开可手输任意字符串原样保存', async () => {
+    clearEffortMemory();
+    await renderAi();
+    await setModel('mystery-model');
+    assert.equal(effortPills(), null, '未知模型不渲染胶囊行');
+    const line = effortLine();
+    assert.ok(line, '应渲染折叠行');
+    assert.match(A.text(line), /推理档位：默认（不指定）/);
+    const toggle = effortCustomBtn();
+    assert.ok(toggle, '应有 [自定义档位 ▾]');
+    assert.equal(A.text(toggle), '自定义档位 ▾');
+    assert.equal(effortCustomInput(), null, '默认收起');
+    await toggle.click();
+    const custom = effortCustomInput();
+    assert.ok(custom, '点开后出现自定义输入框');
+    assert.equal(custom.tag, 'input');
+    assert.equal(A.text(effortCustomBtn()), '自定义档位 ▴');
+    custom.value = 'Ultra';
+    await custom.dispatch('input', { target: custom });
+    assert.match(A.text(effortLine()), /推理档位：Ultra/, '输入时折叠行实时回显');
+    assert.equal(effortHint()._cls.has('hidden'), false, 'ultra 同样提示');
+    await custom.dispatch('change', { target: custom });
+    const saved = JSON.parse(A.ctx.localStorage.getItem('mem0.aiEffortMemory'));
+    const hit = saved.find((x) => x.k === 'openai::https://api.openai.com::mystery-model');
+    assert.ok(hit, '自定义档位按 provider::origin::model 记忆');
+    assert.equal(hit.v, 'Ultra', '原样保存，不改大小写');
+    // 切到有档位模型：不支持的档位归零；切回来恢复记忆
+    await setModel('gpt-5.2');
+    assert.equal(effortPill('默认')._cls.has('on'), true, '切到不支持该档位的模型应归零');
+    await setModel('mystery-model');
+    assert.match(A.text(effortLine()), /推理档位：Ultra/, '切回原模型自动恢复记忆');
+    assertNoBadText('推理档位（折叠 / 自定义）');
+  });
+
+  await test('档位记忆 LRU：键为 provider::origin::model，上限 50 条，命中刷新顺序', () => {
+    const mem = A.ev('window.mem0Ext.effortMemory');
+    assert.equal(mem.limit, 50);
+    assert.equal(mem.key('openai', 'https://api.test/v1', 'gpt-5.2'), 'openai::https://api.test::gpt-5.2');
+    assert.equal(mem.key('ollama', 'http://127.0.0.1:11434/v1', 'qwen3:8b'), 'ollama::http://127.0.0.1:11434::qwen3:8b');
+    clearEffortMemory();
+    for (let i = 0; i < 60; i++) mem.set(`k${i}`, `v${i}`);
+    const list = JSON.parse(A.ctx.localStorage.getItem('mem0.aiEffortMemory'));
+    assert.equal(list.length, 50, '超过 50 条只保留最近 50 条');
+    assert.equal(mem.get('k0'), '', '最久未用的键被淘汰');
+    assert.equal(mem.get('k59'), 'v59');
+    mem.get('k10'); // 命中刷新为最近使用
+    mem.set('k60', 'v60');
+    assert.equal(mem.get('k10'), 'v10', '命中过的键不应被淘汰');
+    assert.equal(mem.get('k11'), '', '新写入淘汰真正的 LRU 键');
+    mem.set('k10', '');
+    assert.equal(mem.get('k10'), '', '空串 = 删除记忆（默认档位）');
+    clearEffortMemory();
+  });
+
+  await test('局部刷新：切档 / 换模型只更新 #ai-effort 子节点，模型 / 地址 / Key 输入框节点不重建', async () => {
+    clearEffortMemory();
+    await renderAi();
+    await setModel('gpt-5.2');
+    const before = { model: modelInput(), url: urlInput(), key: keyInput(), effort: effortBox() };
+    await effortPill('high').click();
+    assert.equal(effortPill('high')._cls.has('on'), true);
+    assert.equal(modelInput(), before.model, '模型输入框节点原地保留');
+    assert.equal(urlInput(), before.url, '地址输入框节点原地保留');
+    assert.equal(keyInput(), before.key, 'Key 输入框节点原地保留');
+    assert.equal(effortBox(), before.effort, '档位子节点原地保留');
+    await setModel('gpt-5.2-codex');
+    assert.equal(modelInput(), before.model, '换模型时模型输入框不重建');
+    assert.equal(effortBox(), before.effort, '换模型时档位子节点不重建');
+    assert.deepEqual(effortPills().children.map((b) => A.text(b)), ['默认', 'none', 'low', 'medium', 'high', 'xhigh', '自定义…']);
+    assertNoBadText('推理档位（局部刷新）');
+  });
+
+  await test('推理档位零内联样式：DOM 无 style / 内联事件，样式只写在现有 css', async () => {
+    clearEffortMemory();
+    await renderAi();
+    await setModel('gpt-5.2');
+    for (const n of A.all(effortBox())) {
+      assert.equal('style' in n.attrs, false, `${n.tag} 不得写 style 属性`);
+      assert.deepEqual(Object.keys(n.style || {}), [], `${n.tag} 不得用 el.style 赋值`);
+      assert.ok(!Object.keys(n.attrs).some((k) => /^on/i.test(k)), `${n.tag} 不得写内联事件`);
+    }
+    await effortPill('自定义…').click();
+    for (const n of A.all(effortBox())) {
+      assert.equal('style' in n.attrs, false, `${n.tag} 不得写 style 属性`);
+      assert.ok(!Object.keys(n.attrs).some((k) => /^on/i.test(k)), `${n.tag} 不得写内联事件`);
+    }
+    const css = read('src/renderer/memory-clean.css');
+    assert.match(css, /\.ai-effort-pills\s*\{[^}]*display:\s*inline-flex/);
+    assert.match(css, /\.ai-effort-hint\s*\{[^}]*color:\s*var\(--muted\)/);
+    assert.match(css, /\.ai-effort-input\s*\{[^}]*background:\s*var\(--surface2\)/);
+    assert.ok(!read('src/renderer/index.html').includes('推理档位'), '静态 HTML 不预置档位行');
+    assertNoBadText('推理档位（CSP）');
+  });
+
+  // ======================================================================
   section('11 主进程 / preload IPC 通道（SPEC 4.4 静态断言）');
   const indexSrc = read('src/main/index.js');
   const preloadSrc = read('src/preload/index.js');
@@ -1848,7 +2533,7 @@ const W = PANEL_WIDTH + INSET * 2;
     ['updateConvMeta', 'updateConvMeta'], ['saveProject', 'saveProject'], ['deleteProject', 'deleteProject'],
     ['saveMemory', 'saveMemory'], ['moveMemory', 'moveMemory'], ['deleteMemory', 'deleteMemory'],
     ['batchImportMemories', 'batchImportMemories'], ['splitImportText', 'splitImportText'],
-    ['saveAiConfig', 'saveAiConfig'], ['testAiConfig', 'testAiConfig'], ['organizeOld', 'organizeOld'],
+    ['saveAiConfig', 'saveAiConfig'], ['testAiConfig', 'testAiConfig'], ['fetchAiModels', 'fetchAiModels'], ['resolveAiModelEfforts', 'resolveAiModelEfforts'], ['organizeOld', 'organizeOld'],
     ['exportMemoryPack', 'exportMemoryPack'], ['importMemoryPack', 'importMemoryPack'],
   ];
   await test('preload 在 window.mem0 下暴露全部 v4 方法', () => {
@@ -1862,6 +2547,22 @@ const W = PANEL_WIDTH + INSET * 2;
       assert.ok(indexSrc.includes(`ipcMain.handle('${channel}', guard(`), `通道 ${channel} 未经过 guard`);
     }
   });
+  await test('fetchAiModels 只读：guard 包裹、调用 aiOrganizer.fetchAiModels，且不调用 saveConfig', () => {
+    const line = indexSrc.split('\n').find((l) => l.includes("ipcMain.handle('fetchAiModels'"));
+    assert.ok(line, 'index.js 缺 fetchAiModels 通道');
+    assert.match(line, /guard\(/);
+    assert.match(line, /aiOrganizer\.fetchAiModels\(/);
+    assert.ok(!line.includes('saveConfig'), 'fetchAiModels 不得调用 saveConfig');
+    assert.match(preloadSrc, /fetchAiModels:\s*call\('fetchAiModels'\)/);
+  });
+  await test('resolveAiModelEfforts 只读：guard 包裹、调用 aiOrganizer.resolveModelEfforts，且不调用 saveConfig', () => {
+    const line = indexSrc.split('\n').find((l) => l.includes("ipcMain.handle('resolveAiModelEfforts'"));
+    assert.ok(line, 'index.js 缺 resolveAiModelEfforts 通道');
+    assert.match(line, /guard\(/);
+    assert.match(line, /aiOrganizer\.resolveModelEfforts\(/);
+    assert.ok(!line.includes('saveConfig'), 'resolveAiModelEfforts 不得调用 saveConfig');
+    assert.match(preloadSrc, /resolveAiModelEfforts:\s*call\('resolveAiModelEfforts'\)/);
+  });
   await test('fullState 扩展 projects / memories / memoryGroups / ai（ai 来自 getPublicState）', () => {
     assert.match(indexSrc, /projects:\s*store\.listProjects\(/);
     assert.match(indexSrc, /memories:\s*store\.listMemories\(/);
@@ -1869,6 +2570,13 @@ const W = PANEL_WIDTH + INSET * 2;
     assert.match(indexSrc, /ai:\s*aiOrganizer\s*\?\s*aiOrganizer\.getPublicState\(\)/);
     // getPublicState 是唯一出口：index.js 不得自行拼出 apiKey 字段
     assert.doesNotMatch(indexSrc, /\bapiKey\s*:/);
+  });
+  await test('autoLaunch 状态并入 state，读取 / 切换 IPC 均经 guard，preload 同步暴露', () => {
+    assert.match(indexSrc, /autoLaunch:\s*autoLaunch\.get\(\)/);
+    assert.match(indexSrc, /ipcMain\.handle\('getAutoLaunch',\s*guard\(/);
+    assert.match(indexSrc, /ipcMain\.handle\('setAutoLaunch',\s*guard\(/);
+    assert.match(preloadSrc, /getAutoLaunch:\s*call\('getAutoLaunch'\)/);
+    assert.match(preloadSrc, /setAutoLaunch:\s*call\('setAutoLaunch'\)/);
   });
   await test('AiOrganizer 由主进程创建并 start / stop，MCP mutated 与整理完成都会推 changed', () => {
     assert.match(indexSrc, /new AiOrganizer\(\{\s*store,\s*electron\s*\}\)/);

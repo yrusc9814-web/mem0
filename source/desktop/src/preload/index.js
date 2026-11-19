@@ -29,6 +29,10 @@ contextBridge.exposeInMainWorld('mem0', {
   /** 设置页：后台轻量 AI 自动整理配置与旧对话批处理 */
   saveAiConfig: call('saveAiConfig'),
   testAiConfig: call('testAiConfig'),
+  /** 只读获取模型列表（不保存配置；草稿 Key 为空且域名变化时不复用旧 Key） */
+  fetchAiModels: call('fetchAiModels'),
+  /** 只读解析单个模型的推理档位（AC4.1 / AC4.2，未命中返回 efforts: null） */
+  resolveAiModelEfforts: call('resolveAiModelEfforts'),
   organizeOld: call('organizeOld'),
   /** 跨设备记忆包导出 / 导入（mem0-memory-pack-v1） */
   exportMemoryPack: call('exportMemoryPack'),
@@ -41,6 +45,9 @@ contextBridge.exposeInMainWorld('mem0', {
   revokeExtensions: call('revokeExtensions'),
   copy: call('copy'),
   setTheme: call('setTheme'),
+  /** 设置页：Windows 开机静默自启动（读取 / 切换，返回 supported、enabled、ok、reason） */
+  getAutoLaunch: call('getAutoLaunch'),
+  setAutoLaunch: call('setAutoLaunch'),
   openDataDir: call('openDataDir'),
   changeDataDir: call('changeDataDir'),
   openUrl: call('openUrl'),

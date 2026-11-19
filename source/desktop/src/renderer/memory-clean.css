@@ -300,6 +300,28 @@
 .ai-eye-btn { position: absolute; right: 6px; height: 23px; padding: 0 7px; border-radius: 6px; border: 0; background: transparent; color: var(--muted); font-size: 11.5px; }
 .ai-eye-btn:hover { color: var(--text); background: var(--bg); }
 .ai-test-btn { height: 35px; padding: 0 14px; flex-shrink: 0; white-space: nowrap; }
+/* 双协议胶囊 + 最终请求 URL 预览 + [获取模型] 浮层（AC2.4 / AC3.3） */
+.ai-url-hd { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ai-mode-pills { display: inline-flex; align-items: center; gap: 5px; }
+.ai-mode-pills .tag-pill { height: 22px; padding: 0 9px; font-size: 11.5px; }
+.ai-url-preview { font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ai-model-wrap { position: relative; display: flex; align-items: center; gap: 6px; }
+.ai-model-wrap input { flex: 1; min-width: 0; }
+.ai-fetch-btn { height: 35px; padding: 0 12px; font-size: 12.5px; }
+.ai-model-pop { left: 0; right: 0; min-width: 0; max-width: none; }
+.ai-model-list { display: grid; }
+.ai-model-list .mi { grid-template-columns: 14px minmax(0, 1fr); }
+.ai-model-empty { padding: 6px 9px 7px; font-size: 12px; color: var(--muted); }
+/* 推理档位：胶囊行 / 折叠行 / 自定义直通（AC4.3） */
+.ai-effort { display: grid; gap: 6px; }
+.ai-effort-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 22px; }
+.ai-effort-lbl { font-size: 12px; color: var(--muted); }
+.ai-effort-cur { color: var(--text2); font-size: 12.5px; font-weight: 500; }
+.ai-effort-pills { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.ai-effort-pills .tag-pill { height: 22px; padding: 0 9px; font-size: 11.5px; }
+.ai-effort-hint { font-size: 11.5px; line-height: 1.5; color: var(--muted); opacity: .82; }
+.ai-effort-input { height: 30px; width: 240px; max-width: 100%; border: 0; border-radius: 8px; padding: 0 10px; background: var(--surface2); color: var(--text); font: 12.5px/1.5 var(--font-ui); box-shadow: inset 0 0 0 .5px var(--hair); outline: none; }
+.ai-effort-input:focus { box-shadow: inset 0 0 0 1px var(--accent), 0 0 0 3px var(--accent-soft); }
 
 @media (max-width: 860px) {
   #view-records .side, .mem-side { width: 248px; }

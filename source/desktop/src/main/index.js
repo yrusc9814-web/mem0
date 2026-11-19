@@ -14,11 +14,14 @@ const { TrayStats } = require('./stats');
 const register = require('./register');
 const platform = require('./platform');
 const { cleanupForQuit } = require('./quit');
+const { createAutoLaunch, hasHiddenFlag } = require('./autolaunch');
 
 const VERSION = app.getVersion();
 // Windows 任务栏图标/分组需要与 build.appId 一致的 AppUserModelId
 if (process.platform === 'win32') app.setAppUserModelId('dev.mem0.desktop');
 const APP_ICON = path.join(__dirname, 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png');
+// Windows 开机静默自启动：仅 Windows 安装版可读写系统登录项（AC1）
+const autoLaunch = createAutoLaunch({ app });
 
 // 单实例
 if (!app.requestSingleInstanceLock()) { app.quit(); process.exit(0); }
@@ -186,6 +189,8 @@ const memoryGroupMeta = () => MEMORY_GROUPS.map((id) => ({ id, ...(MEMORY_GROUP_
 /** AI 尚未初始化时的公开状态兜底（同样不含 apiKey） */
 const EMPTY_AI_STATE = {
   enabled: false, provider: 'deepseek', baseUrl: '', model: '',
+  apiMode: 'chat_completions',
+  reasoningEffort: '',
   hasKey: false, keyHint: '', statusText: '未配置', statusOk: false,
   unorganizedCount: 0, organizing: false,
 };
@@ -216,6 +221,7 @@ function fullState() {
     memories: store.listMemories(),
     memoryGroups: memoryGroupMeta(),
     ai: aiOrganizer ? aiOrganizer.getPublicState() : { ...EMPTY_AI_STATE },
+    autoLaunch: autoLaunch.get(),
     localSources: ingestor.getStatus(),
     webSources: WEB_SOURCES.map((p) => ({ id: `${p}-web`, platform: p, enabled: store.isSourceEnabled(`${p}-web`) })),
     services,
@@ -355,6 +361,10 @@ function registerIpc() {
     push('changed', state);
     return state;
   }));
+  // 只读获取模型列表：绝不调用 saveConfig，不污染后台运行态（AC3.1）
+  ipcMain.handle('fetchAiModels', guard((cfg) => aiOrganizer.fetchAiModels(cfg || {})));
+  // 只读解析单个模型的推理档位（AC4.1 / AC4.2）：同样绝不调用 saveConfig
+  ipcMain.handle('resolveAiModelEfforts', guard((cfg, modelId) => aiOrganizer.resolveModelEfforts(cfg || {}, modelId)));
   ipcMain.handle('testAiConfig', guard(async (cfg) => {
     const result = await aiOrganizer.testConfig(cfg || {});
     const state = fullState();
@@ -426,6 +436,9 @@ function registerIpc() {
     if (win && !win.isDestroyed()) win.setBackgroundColor(nativeTheme.shouldUseDarkColors ? '#262624' : '#FAF9F5');
     return p;
   }));
+  // Windows 开机静默自启动：读取状态 / 切换（非 Windows 或未安装版由 autolaunch.js 返回 supported:false + 原因）
+  ipcMain.handle('getAutoLaunch', guard(() => autoLaunch.get()));
+  ipcMain.handle('setAutoLaunch', guard((enabled) => autoLaunch.set(enabled)));
   ipcMain.handle('copy', guard((text) => { clipboard.writeText(String(text)); return true; }));
   ipcMain.handle('openDataDir', guard(() => shell.openPath(dataDir())));
   ipcMain.handle('changeDataDir', guard(() => changeDataDir()));
@@ -582,10 +595,11 @@ async function boot() {
 
   registerIpc();
   setupAppMenu();
-  createWindow();
-  bootLog('window created');
+  // 开机自启动以 --hidden 拉起：不建主窗口（零渲染进程），托盘常驻、后台服务照常
+  const hiddenStart = hasHiddenFlag(process.argv);
+  if (!hiddenStart) { createWindow(); bootLog('window created'); }
   createTray();
-  bootLog('tray created');
+  bootLog(hiddenStart ? 'tray created (hidden start)' : 'tray created');
   // app ready 后启动后台静默整理定时器（未启用 / 无 Key 时每轮空转，不发请求）
   aiOrganizer.start();
   bootLog('ai organizer started');
@@ -599,16 +613,25 @@ async function boot() {
     ingestor.once('scanned', (r) => bootLog(`first scan done (${r.changed} changed, ${r.ms}ms)`));
     setTimeout(() => { if (!quitting) { bootLog('first scan start'); ingestor.start(); } }, FIRST_SCAN_DELAY_MS);
   };
-  const firstWin = win;
-  firstWin.once('ready-to-show', () => bootLog('window ready-to-show'));
-  firstWin.webContents.once('did-finish-load', () => { bootLog('renderer did-finish-load'); afterLoad(); });
-  // 兜底：页面迟迟不加载（或加载失败）也要把服务和备份跑起来
-  setTimeout(afterLoad, 5000);
+  if (hiddenStart) {
+    // 没有窗口可等：托盘建好后立刻启动 MCP、插件桥与首轮备份扫描
+    bootLog('hidden start: services without window');
+    afterLoad();
+  } else {
+    const firstWin = win;
+    firstWin.once('ready-to-show', () => bootLog('window ready-to-show'));
+    firstWin.webContents.once('did-finish-load', () => { bootLog('renderer did-finish-load'); afterLoad(); });
+    // 兜底：页面迟迟不加载（或加载失败）也要把服务和备份跑起来
+    setTimeout(afterLoad, 5000);
+  }
 }
 
 // macOS：系统关机 / 注销 / 重启时不弹退出确认
 try { electron.powerMonitor.on('shutdown', () => { systemShuttingDown = true; }); } catch { /* ignore */ }
-app.on('second-instance', () => { if (popover) popover.hide(); openMain(); });
+// 第二次启动：开机静默参数（--hidden）不弹主窗口，其余照旧前置主窗口
+app.on('second-instance', (_ev, argv) => { if (hasHiddenFlag(argv)) return; if (popover) popover.hide(); openMain(); });
+// macOS 点 Dock 图标 / 其他平台 activate：隐藏小窗并前置主窗口
+app.on('activate', () => { if (popover) popover.hide(); openMain(); });
 app.on('window-all-closed', (e) => e.preventDefault());
 app.on('before-quit', async (e) => {
   // macOS 用户主动退出（⌘Q / 菜单）：先确认；托盘「退出」已明确点过，不再二次确认

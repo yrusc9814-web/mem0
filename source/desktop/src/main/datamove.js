@@ -92,13 +92,16 @@ function copyData(from, to) {
 /**
  * 重启参数：免安装版（electron-builder portable）运行时 process.execPath 在临时解压目录，
  * 直接 relaunch 会重启临时目录里的程序；AppImage 同理要用外层镜像。返回 undefined 表示照旧 relaunch。
+ * 开机静默自启动（--hidden）重启时剥离该参数：用户手动重启应正常显示主窗口。
  */
 function relaunchOptions(env, execPath, argv) {
   const e = env || {};
-  const args = Array.isArray(argv) ? argv.slice(1) : [];
-  if (e.PORTABLE_EXECUTABLE_FILE) return { execPath: e.PORTABLE_EXECUTABLE_FILE, args };
-  if (e.APPIMAGE) return { execPath: e.APPIMAGE, args };
-  return undefined;
+  const raw = Array.isArray(argv) ? argv.slice(1) : [];
+  const hidden = raw.includes('--hidden');
+  const args = raw.filter((a) => a !== '--hidden');
+  const exe = e.PORTABLE_EXECUTABLE_FILE || e.APPIMAGE || (hidden ? execPath : '');
+  if (!exe && !hidden) return undefined;
+  return { ...(exe ? { execPath: exe } : {}), args };
 }
 
 function readPointer(file) {
