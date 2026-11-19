@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "mem0 · AI 对话备份",
   "short_name": "mem0",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "把 ChatGPT、Claude、Gemini、DeepSeek、豆包、元宝、Kimi、千问、Grok、Hark 的对话实时备份到本机 mem0 桌面端。",
   "minimum_chrome_version": "116",
   "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },

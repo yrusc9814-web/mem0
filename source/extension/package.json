@@ -1,6 +1,6 @@
 {
   "name": "mem0-extension",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "mem0 浏览器插件（Chrome / Edge，MV3）",
   "scripts": {

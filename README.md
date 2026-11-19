@@ -6,9 +6,9 @@
 
 | 平台 | 版本 | 文件 |
 |---|---|---|
-| Windows 安装版 | 0.5.5 | `windows/mem0 Setup 0.5.5.exe` |
-| macOS（Apple 芯片） | 0.5.5 | `mac/mem0-0.5.5-arm64-mac.zip` |
-| 浏览器插件（Chrome/Edge） | 0.1.4 | `extension/mem0-extension-0.1.4.zip` |
+| Windows 安装版 | 0.6.0 | `windows/mem0 Setup 0.6.0.exe` |
+| macOS（Apple 芯片） | 0.6.0 | `mac/mem0-0.6.0-arm64-mac.zip` |
+| 浏览器插件（Chrome/Edge） | 0.1.5 | `extension/mem0-extension-0.1.5.zip` |
 
 ## 安装说明
 
@@ -18,6 +18,8 @@
 
 ## 更新
 
+- 桌面端 0.6.0：记忆与推进事项改为 v4 双栏；多源会话剔除工具调用等噪音并剥离子代理；4 个 MCP 工具按需读写；后台静默 AI 自动整理，支持 OpenAI 双协议（Chat Completions / Responses）与按模型动态识别推理档位；Windows 开机静默自启动（设置里开关，默认关闭）。
+- 浏览器插件 0.1.5：剔除 Gemini 的思考过程节点。
 - 桌面端 0.5.5：Claude 会话只保存用户和 AI 的正文，不再保存工具调用、工具结果、思考过程、系统提醒、命令输出、中断提示和压缩摘要；首次启动会把已保存的 Claude 会话按新规则重读一次。
 
 ## 源码
