@@ -28,6 +28,7 @@ class LocalIngestor extends EventEmitter {
     this.stopped = false;
     this.idleWaiters = []; // stopAndWait 的等待者：在途扫描结束时唤醒
     this.claudeCleanV1Done = false; // 0.5.5 F2：Claude Code 旧游标清理只在本进程执行一次
+    this.dshCleanV1Done = false; // 0.6.1：DSH 旧游标清理只在本进程执行一次
     this.status = Object.fromEntries(Object.keys(ADAPTERS).map((id) => [id, { found: false, files: 0, error: null, lastScanAt: null }]));
   }
 
@@ -38,9 +39,17 @@ class LocalIngestor extends EventEmitter {
     this.claudeCleanV1Done = true;
   }
 
+  /** 0.6.1：启动 ingest 时清一次 DSH 游标，让旧会话按新解析器重洗 thinking/tool_calls */
+  ensureDshCleanV1() {
+    if (this.dshCleanV1Done) return;
+    if (typeof this.store.migrateDshCleanV1 === 'function') this.store.migrateDshCleanV1();
+    this.dshCleanV1Done = true;
+  }
+
   start() {
     this.stopped = false;
     this.ensureClaudeCleanV1();
+    this.ensureDshCleanV1();
     const tick = async () => {
       if (this.stopped) return;
       await this.scanOnce().catch((e) => this.emit('error', e));
@@ -67,6 +76,7 @@ class LocalIngestor extends EventEmitter {
   async scanOnce() {
     if (this.running) return { changed: 0 };
     this.ensureClaudeCleanV1();
+    this.ensureDshCleanV1();
     this.running = true;
     let changed = 0;
     const t0 = Date.now();

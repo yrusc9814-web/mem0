@@ -546,6 +546,48 @@ function nonEmptyString(value) {
   return value == null ? '' : String(value).trim();
 }
 
+/**
+ * 构造自动整理的用户 Prompt（纯函数，便于单测）。
+ * 明确列出完整 JSON 结构与全部子字段，并保留活跃推进事项列表与对话原文。
+ */
+function buildOrganizePrompt(projects, transcript) {
+  return [
+    '你是本地对话整理助手。请只输出一个 JSON 对象，不要输出 Markdown 说明。',
+    'JSON 结构（必须严格按此字段名与类型输出）：',
+    '{',
+    '  "shortTitle": string,',
+    '  "summary": string,',
+    '  "decisions": string[],',
+    '  "nextStep": string,',
+    '  "projectMatch": {',
+    '    "action": "none" | "existing" | "new",',
+    '    "projectId"?: string,',
+    '    "newProjectName"?: string,',
+    '    "state"?: "推进中" | "卡住" | "待验证",',
+    '    "progress"?: string,',
+    '    "addedDecisions"?: string[],',
+    '    "addedRejected"?: string[],',
+    '    "nextStep"?: string',
+    '  },',
+    '  "pitfallCard": null | {',
+    '    "title": string,',
+    '    "body": string,',
+    '    "tags": string[]',
+    '  }',
+    '}',
+    '字段说明：',
+    '- shortTitle: string（简明中文短标题）',
+    '- summary: string（1~2 句话核心摘要）',
+    '- decisions: string[]（已拍板结论，无则 []）',
+    '- nextStep: string（下一步待办，无则 ""）',
+    '- projectMatch.action 只能是 none / existing / new；action="existing" 时 projectId 必须填下面活跃推进事项列表里的真实 id；日常零散独立问答选 "none"。',
+    '- pitfallCard: null 或对象；对话包含明确故障现象/踩坑根因与有效修复结论时输出对象，body 简明写清「根因 → 修复方法」，tags 给 1~3 个短标签；普通对话输出 null。',
+    `当前活跃推进事项：${JSON.stringify(projects)}`,
+    '对话原文（已脱敏）：',
+    String(transcript == null ? '' : transcript),
+  ].join('\n');
+}
+
 /** 开头连续 think / thought 思考块（AC5.5：仅锚定字符串开头剥离，绝不扫描正文内部）。 */
 const LEADING_THINK_RE = /^\s*(?:<(?:think|thought)>[\s\S]*?<\/(?:think|thought)>\s*)+/;
 
@@ -1698,15 +1740,7 @@ class AiOrganizer {
         workspace: p.workspace || '',
         state: p.state,
       }));
-      const prompt = [
-        '你是本地对话整理助手。请只输出一个 JSON 对象，不要输出 Markdown 说明。',
-        '字段：shortTitle, summary, decisions, nextStep, projectMatch, pitfallCard。',
-        'projectMatch.action 只能是 none / existing / new；existing 时必须使用下面列表中的真实事项 id；',
-        '日常独立零散问答必须选 none。pitfallCard 仅在有明确故障根因与修复结论时给出，否则为 null。',
-        `当前活跃推进事项：${JSON.stringify(projects)}`,
-        '对话原文（已脱敏）：',
-        transcript,
-      ].join('\n');
+      const prompt = buildOrganizePrompt(projects, transcript);
       const text = await this.callChat([
         { role: 'system', content: '你只返回严格 JSON，不返回任何解释或代码围栏。' },
         { role: 'user', content: prompt },
@@ -1778,7 +1812,7 @@ class AiOrganizer {
     if (!pm || typeof pm !== 'object' || Array.isArray(pm)) return undefined;
     const action = nonEmptyString(pm.action).toLowerCase();
     if (action === 'existing') {
-      const pid = nonEmptyString(pm.projectId);
+      const pid = nonEmptyString(pm.projectId) || nonEmptyString(pm.id);
       if (!pid) return undefined;
       const existing = this.store.getProject(pid);
       if (!existing || existing.archived) return undefined;
@@ -1829,8 +1863,17 @@ class AiOrganizer {
    */
   _applyPitfallCard(conv, card) {
     if (!card || typeof card !== 'object' || Array.isArray(card)) return null;
-    const title = nonEmptyString(card.title).slice(0, 120);
-    const body = nonEmptyString(card.body);
+    // 兼容模型返回的多种字段名：正文/标题任一为空即视为无效卡
+    const firstStr = (...vs) => vs.map(nonEmptyString).find(Boolean) || '';
+    let body = firstStr(card.body, card.content, card.description);
+    if (!body) {
+      // 模型拆成「问题 + 修复」两段时拼成完整正文；只给 solution/fix 一段时直接用它
+      const problem = firstStr(card.problem, card.rootCause, card.issue);
+      const fix = firstStr(card.fix, card.solution, card.resolution);
+      body = problem && fix ? `${problem} → ${fix}` : fix;
+    }
+    let title = firstStr(card.title, card.name, card.summary).slice(0, 120);
+    if (!title && body) title = deriveShortTitle(body).slice(0, 120);
     if (!title || !body) return null;
     const group = AI_PITFALL_GROUP;
     const tags = normalizeStringList(card.tags).slice(0, 20);
@@ -1947,6 +1990,7 @@ module.exports = {
   DEFAULT_MAX_CHARS,
   normalizeApiMode,
   normalizeReasoningEffort,
+  buildOrganizePrompt,
   buildEndpoint,
   buildModelsUrl,
   normalizeOrigin,

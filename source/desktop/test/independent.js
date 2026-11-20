@@ -397,6 +397,54 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
     store.close();
   }
 
+  // ---------- DSH（deepseek-harness）：0.6.1 旧游标清理 ----------
+  {
+    const store = freshStore();
+    // 所有来源指向不存在的目录，避免真实 root 干扰；只验证游标迁移与墓碑语义
+    const onlyRoots = Object.fromEntries(Object.keys(ADAPTERS).map((id) => [id, path.join(T, 'nope-dsh', id)]));
+    const dshConv = () => ({
+      source: 'deepseek-harness',
+      externalId: 'dsh-clean-1',
+      ingestMethod: 'local',
+      messages: [
+        { role: 'user', content: 'DSH 旧问题' },
+        { role: 'assistant', content: 'DSH 旧回答' },
+      ],
+    });
+
+    await t('1 dsh clean', 'migrateDshCleanV1 只执行一次、只清 DSH 游标、墓碑不复活', async () => {
+      store.setCursor('/tmp/a.jsonl.zstd', 'deepseek-harness', 10, 10);
+      store.setCursor('/tmp/b.jsonl', 'codex', 1, 1);
+      // 先入库再删除，产生墓碑（msg_count = 2）
+      const up = store.upsertConversation(dshConv());
+      assert.equal(store.getConversation(up.id, { limit: 10 }).messages.length, 2);
+      store.deleteConversation(up.id);
+      assert.equal(store.getConversation(up.id, { limit: 1 }), null);
+      assert.ok(store.db.prepare('SELECT 1 FROM deleted_conversations WHERE id = ?').get(up.id), '应有墓碑');
+
+      await new LocalIngestor(store, onlyRoots).scanOnce();
+      assert.equal(store.getKv('dsh_clean_v1'), '1');
+      assert.equal(store.getCursor('/tmp/a.jsonl.zstd'), null, 'DSH 游标应被清空');
+      const codex = store.getCursor('/tmp/b.jsonl');
+      assert.ok(codex && codex.size === 1 && codex.mtime_ms === 1, '其它来源游标不应被清');
+
+      // 重洗：同条数（或更少）不复活（db.upsert 的墓碑语义）
+      const again = store.upsertConversation(dshConv());
+      assert.equal(again.changed, false);
+      assert.equal(store.getConversation(up.id, { limit: 1 }), null, '删除的会话不应复活');
+      assert.equal(convs(store, 'deepseek-harness').filter((c) => c.id === up.id).length, 0, '列表也不应出现');
+      assert.ok(store.db.prepare('SELECT 1 FROM deleted_conversations WHERE id = ?').get(up.id), '墓碑仍在');
+
+      // 只执行一次：再写游标后第二次启动不应再清
+      store.setCursor('/tmp/a.jsonl.zstd', 'deepseek-harness', 10, 10);
+      await new LocalIngestor(store, onlyRoots).scanOnce();
+      assert.ok(store.getCursor('/tmp/a.jsonl.zstd'), '第二次启动不应再清游标');
+      assert.equal(store.migrateDshCleanV1(), false, '已标记后迁移应返回 false');
+      assert.equal(store.getKv('dsh_clean_v1'), '1');
+    });
+    store.close();
+  }
+
   // ---------- Codex ----------
   {
     const store = freshStore();
@@ -4112,6 +4160,58 @@ function msgs(store, id) { return store.getConversation(id, { limit: 2000 }).mes
       const created = store.listProjects().find((x) => x.name === '新事项');
       assert.ok(created, 'action=new 应创建事项');
       assert.equal(store.getConversation(conv4.id, { limit: 1 }).project_id, created.id);
+      store.close();
+    });
+
+    await t('2h Schema', 'buildOrganizePrompt 写全 pitfallCard/projectMatch 子字段', () => {
+      const { buildOrganizePrompt } = require(path.join(ROOT, 'src/main/ai-organizer'));
+      const projects = [{ id: 'proj-schema-1', name: 'Schema 事项', workspace: '/w/schema', state: '推进中' }];
+      const transcript = '用户：Schema 会话问题\n助手：Schema 会话回答';
+      const prompt = buildOrganizePrompt(projects, transcript);
+      for (const key of ['pitfallCard', '"title"', '"body"', '"tags"', 'projectId', 'newProjectName']) {
+        assert.ok(prompt.includes(key), `prompt 应包含 ${key}`);
+      }
+      assert.match(prompt, /"none"\s*\|\s*"existing"\s*\|\s*"new"/, 'projectMatch.action 三个合法值必须列全');
+      assert.ok(prompt.includes('proj-schema-1'), 'prompt 应包含传入事项 id');
+      assert.ok(prompt.includes(transcript), 'prompt 应包含对话原文');
+    });
+
+    await t('2h 别名', 'projectMatch.id 与 problem+fix / name+content 别名落库且仅写踩坑分组', async () => {
+      const store = freshStore();
+      const base = 1_700_000_700_000;
+      const proj = store.saveProject({ name: 'Electron 打包事项', state: '推进中' });
+      const conv = addConv(store, 'alias-conv', ['Electron 打包后白屏怎么排查', '把 loadFile 路径改成 __dirname 相对路径就好了'], base);
+      const org = makeOrg(store, { now: () => base + 1000 });
+      enable(org);
+      responder = () => aiReply({
+        shortTitle: 'Electron 打包白屏',
+        summary: 'loadFile 路径导致白屏',
+        projectMatch: { action: 'existing', id: proj.id },
+        pitfallCard: { group: '个人与职业背景', problem: 'Electron 打包后白屏', fix: '把 loadFile 路径改为 __dirname 相对路径', tags: ['Electron'] },
+      });
+      const r = await org.organizeConversation(conv.id);
+      assert.ok(r);
+      assert.equal(store.getConversation(conv.id, { limit: 1 }).project_id, proj.id, 'projectMatch.id 别名应能匹配既有事项');
+      let pits = store.listMemories({ group: '踩坑与经验库' });
+      assert.equal(pits.length, 1);
+      assert.ok(pits[0].title && String(pits[0].title).trim(), '无 title 时应 deriveShortTitle 兜底出非空标题');
+      assert.equal(pits[0].body, 'Electron 打包后白屏 → 把 loadFile 路径改为 __dirname 相对路径', 'problem + fix 应拼成「问题 → 修复」');
+      assert.match(pits[0].body, /白屏/);
+      assert.match(pits[0].body, /loadFile/);
+      assert.deepEqual(pits[0].tags, ['Electron']);
+
+      responder = () => aiReply({ pitfallCard: { name: 'npm 镜像超时', content: '根因：registry 失效 → 修复：切换镜像源' } });
+      const conv2 = addConv(store, 'alias-conv-2', ['npm 装包一直超时', '切了镜像源就好了'], base + 100);
+      await org.organizeConversation(conv2.id);
+      pits = store.listMemories({ group: '踩坑与经验库' });
+      assert.equal(pits.length, 2);
+      const np = pits.find((m) => m.title === 'npm 镜像超时');
+      assert.ok(np, 'name 别名应作为卡片标题');
+      assert.match(np.body, /registry 失效/);
+      assert.match(np.body, /切换镜像源/);
+      for (const group of ['个人与职业背景', '协作与沟通准则', '环境与工作流']) {
+        assert.equal(store.listMemories({ group }).length, 0, `${group} 必须 0 写入`);
+      }
       store.close();
     });
 

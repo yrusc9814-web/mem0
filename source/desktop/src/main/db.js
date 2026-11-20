@@ -256,6 +256,19 @@ class Store {
     });
   }
 
+  /**
+   * 0.6.1：一次性清掉 DSH 的文件游标，让旧会话按新解析器重洗 thinking/tool_calls。
+   * 墓碑由 upsert 拦截不复活；用 kv 标记保证只执行一次；返回本次是否执行。
+   */
+  migrateDshCleanV1() {
+    if (this.getKv('dsh_clean_v1')) return false;
+    return this.tx(() => {
+      this.db.prepare("DELETE FROM file_cursors WHERE source = 'deepseek-harness'").run();
+      this.setKv('dsh_clean_v1', '1');
+      return true;
+    });
+  }
+
   // ---------- 文件游标 ----------
   getCursor(p) {
     return this.db.prepare('SELECT size, mtime_ms FROM file_cursors WHERE path = ?').get(p) || null;
